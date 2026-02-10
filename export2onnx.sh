@@ -9,7 +9,7 @@ fi
 
 "$PYTHON_BIN" export_models.py \
   --weights ./dpvo.pth \
-  --out ./exported_models \
+  --out ./exported_models_IR7 \
   --height 480 --width 640 \
   --edges 256 \
-  --opset 17
+  --opset 13

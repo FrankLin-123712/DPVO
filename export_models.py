@@ -66,14 +66,20 @@ def register_dpvo_custom_ops(opset: int):
     """
 
     def scatter_max_symbolic(g, src, index, dim=None, out=None, dim_size=None, fill_value=None):
+        """
+        Export torch_scatter.scatter_max as a custom two-input op:
+          dpvo::scatter_max(src, index) -> (values, argmax)
+
+        Older ORT custom kernel expects exactly 2 inputs, so we must not
+        materialize `dim` as a third input. Encode it as an attribute instead.
+        Other optional arguments are ignored for export.
+        """
         inputs = [src, index]
         attrs = {}
-        # dim is usually an int, but can be a graph value; handle both.
         if dim is not None:
-            if isinstance(dim, torch._C.Value):
-                inputs.append(dim)
-            else:
-                attrs["dim_i"] = int(dim)
+            # Force dim to an integer attribute even if provided as a graph value.
+            dim_const = sym_help._maybe_get_const(dim, "i")
+            attrs["dim_i"] = int(dim_const)
 
         node = g.op("dpvo::scatter_max", *inputs, outputs=2, **attrs)
         values, argmax = node[0], node[1]
