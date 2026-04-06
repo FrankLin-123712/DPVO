@@ -172,6 +172,55 @@ python evaluate_icl_nuim.py --trials=5 --plot --save_trajectory
 python evaluate_kitti.py --trials=5 --plot --save_trajectory
 ```
 
+## ONNX Export
+The repo ships one supported ONNX export path under `tools/`. The update block export uses explicit neighbor indices `ix` and `jx`, which is the fixed replacement for the older `fastba.neighbors(...)` ONNX export.
+
+Export both ONNX models with the helper script:
+```bash
+./tools/export2onnx.sh
+```
+
+The helper accepts overrides via environment variables such as `WEIGHTS`, `OUT_DIR`, `HEIGHT`, `WIDTH`, `EDGES`, and `OPSET`.
+
+Or call the exporter directly:
+```bash
+python tools/export_models.py \
+    --weights ./dpvo.pth \
+    --out ./exported_models \
+    --height 480 \
+    --width 640 \
+    --edges 256 \
+    --opset 13
+```
+
+This writes:
+- `exported_models/feature_extractor.onnx`
+- `exported_models/update_block.onnx`
+
+The exported update block takes these inputs:
+- `net`
+- `ctx`
+- `corr`
+- `ii`
+- `jj`
+- `kk`
+- `ix`
+- `jx`
+
+And returns:
+- `net_out`
+- `delta`
+- `weight`
+
+Useful helpers:
+- `python tools/verify_onnxmodel.py exported_models/update_block.onnx`
+- `python tools/generate_update_block_case.py --output /tmp/dpvo_update_block_case_small`
+- `./tools/turn_mov2png.sh`
+
+Notes:
+- `feature_extractor.onnx` exports only the image encoders. The Python `patchify` logic and custom DPVO runtime ops are not folded into this model.
+- `update_block.onnx` expects host-side code to precompute `corr`, `ctx`, and the graph index tensors, including the explicit neighbor links `ix` and `jx`.
+
 ## Training
 Make sure you have run `./download_models_and_data.sh`. Your directory structure should look as follows
 
