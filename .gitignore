@@ -164,5 +164,4 @@ thirdparty/*
 
 movies/*
 trajectory_plots/*
-dpvo.pdf
 exported_models/*
