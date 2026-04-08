@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Dict, List, Sequence, Set, Tuple
 
 import torch
 from torch.onnx import register_custom_op_symbolic
@@ -48,6 +49,226 @@ SCATTER_SUM_PATCHES = {
         "/agg_ij/Expand_2_output_0",
     ),
 }
+
+Field = Tuple[int, int, object]
+
+
+def encode_varint(value: int) -> bytes:
+    if value < 0:
+        value += 1 << 64
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+    shift = 0
+    value = 0
+    while True:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return value, offset
+        shift += 7
+
+
+def parse_fields(data: bytes) -> List[Field]:
+    fields: List[Field] = []
+    offset = 0
+    while offset < len(data):
+        key, offset = decode_varint(data, offset)
+        field_no = key >> 3
+        wire_type = key & 0x07
+        if wire_type == 0:
+            value, offset = decode_varint(data, offset)
+        elif wire_type == 1:
+            value = data[offset : offset + 8]
+            offset += 8
+        elif wire_type == 2:
+            size, offset = decode_varint(data, offset)
+            value = data[offset : offset + size]
+            offset += size
+        elif wire_type == 5:
+            value = data[offset : offset + 4]
+            offset += 4
+        else:
+            raise ValueError(f"Unsupported wire type {wire_type}")
+        fields.append((field_no, wire_type, value))
+    return fields
+
+
+def encode_field(field_no: int, wire_type: int, value: object) -> bytes:
+    out = bytearray()
+    out.extend(encode_varint((field_no << 3) | wire_type))
+    if wire_type == 0:
+        out.extend(encode_varint(int(value)))
+    elif wire_type == 1:
+        out.extend(value)  # type: ignore[arg-type]
+    elif wire_type == 2:
+        payload = bytes(value)  # type: ignore[arg-type]
+        out.extend(encode_varint(len(payload)))
+        out.extend(payload)
+    elif wire_type == 5:
+        out.extend(value)  # type: ignore[arg-type]
+    else:
+        raise ValueError(f"Unsupported wire type {wire_type}")
+    return bytes(out)
+
+
+def serialize_fields(fields: Sequence[Field]) -> bytes:
+    return b"".join(
+        encode_field(field_no, wire_type, value)
+        for field_no, wire_type, value in fields
+    )
+
+
+def decode_text(value: object) -> str:
+    return bytes(value).decode("utf-8", errors="replace")
+
+
+def make_length_field(field_no: int, text: str) -> Field:
+    return (field_no, 2, text.encode("utf-8"))
+
+
+def make_dim_attr(dim: int) -> bytes:
+    fields: List[Field] = [
+        make_length_field(1, "dim"),
+        (20, 0, 2),  # AttributeProto::INT
+        (3, 0, dim),
+    ]
+    return serialize_fields(fields)
+
+
+def parse_node_signature(node_bytes: bytes) -> tuple[str, list[str], list[str]]:
+    name = ""
+    inputs: list[str] = []
+    outputs: list[str] = []
+    for field_no, wire_type, value in parse_fields(node_bytes):
+        if field_no == 1 and wire_type == 2:
+            inputs.append(decode_text(value))
+        elif field_no == 2 and wire_type == 2:
+            outputs.append(decode_text(value))
+        elif field_no == 3 and wire_type == 2:
+            name = decode_text(value)
+    return name, inputs, outputs
+
+
+def parse_value_info_name(value_info_bytes: bytes) -> str:
+    for field_no, wire_type, value in parse_fields(value_info_bytes):
+        if field_no == 1 and wire_type == 2:
+            return decode_text(value)
+    return ""
+
+
+def rewrite_scatter_sum_node(node_bytes: bytes) -> tuple[bytes, bool]:
+    fields = parse_fields(node_bytes)
+    name = ""
+    outputs: List[bytes] = []
+    preserved: List[Field] = []
+
+    for field_no, wire_type, value in fields:
+        if field_no == 3 and wire_type == 2:
+            name = decode_text(value)
+        elif field_no == 2 and wire_type == 2:
+            outputs.append(bytes(value))
+        elif field_no not in (1, 2, 3, 4, 5, 7):
+            preserved.append((field_no, wire_type, value))
+
+    replacement_inputs = SCATTER_SUM_PATCHES.get(name)
+    if replacement_inputs is None:
+        return node_bytes, False
+
+    rewritten_fields: List[Field] = []
+    for input_name in replacement_inputs:
+        rewritten_fields.append(make_length_field(1, input_name))
+    for output_name in outputs:
+        rewritten_fields.append((2, 2, output_name))
+    rewritten_fields.append(make_length_field(3, name))
+    rewritten_fields.append(make_length_field(4, "scatter_sum"))
+    rewritten_fields.append((5, 2, make_dim_attr(1)))
+    rewritten_fields.append(make_length_field(7, "dpvo"))
+    rewritten_fields.extend(preserved)
+    return serialize_fields(rewritten_fields), True
+
+
+def finalize_update_model(path: Path) -> int:
+    """
+    Finalize the exported update model so it is ready to run directly:
+    - rewrite legacy scatter_sum lowerings into dpvo::scatter_sum
+    - prune dead nodes left behind by the rewrite
+    - strip internal value_info shape hints that go stale at runtime
+    """
+    model_fields = parse_fields(path.read_bytes())
+    patched_model: List[Field] = []
+    patch_count = 0
+
+    for field_no, wire_type, value in model_fields:
+        if field_no != 7 or wire_type != 2:
+            patched_model.append((field_no, wire_type, value))
+            continue
+
+        graph_fields = parse_fields(bytes(value))
+        rewritten_graph: List[Field] = []
+        for graph_field_no, graph_wire_type, graph_value in graph_fields:
+            if graph_field_no == 1 and graph_wire_type == 2:
+                rewritten_node, modified = rewrite_scatter_sum_node(bytes(graph_value))
+                rewritten_graph.append((graph_field_no, graph_wire_type, rewritten_node))
+                patch_count += int(modified)
+            else:
+                rewritten_graph.append((graph_field_no, graph_wire_type, graph_value))
+
+        graph_output_names = {
+            parse_value_info_name(bytes(graph_value))
+            for graph_field_no, graph_wire_type, graph_value in rewritten_graph
+            if graph_field_no == 12 and graph_wire_type == 2
+        }
+
+        producer_by_output: Dict[str, int] = {}
+        node_signatures: List[tuple[str, list[str], list[str]]] = []
+        node_field_indices: List[int] = []
+        for index, (graph_field_no, graph_wire_type, graph_value) in enumerate(rewritten_graph):
+            if graph_field_no != 1 or graph_wire_type != 2:
+                continue
+            signature = parse_node_signature(bytes(graph_value))
+            node_signatures.append(signature)
+            node_field_indices.append(index)
+            _, _, outputs = signature
+            for output_name in outputs:
+                producer_by_output[output_name] = len(node_signatures) - 1
+
+        live_nodes: Set[int] = set()
+        worklist = [name for name in graph_output_names if name]
+        while worklist:
+            tensor_name = worklist.pop()
+            producer_index = producer_by_output.get(tensor_name)
+            if producer_index is None or producer_index in live_nodes:
+                continue
+            live_nodes.add(producer_index)
+            _, inputs, _ = node_signatures[producer_index]
+            worklist.extend(input_name for input_name in inputs if input_name)
+
+        live_field_indices = {node_field_indices[index] for index in live_nodes}
+        finalized_graph: List[Field] = []
+        for index, (graph_field_no, graph_wire_type, graph_value) in enumerate(rewritten_graph):
+            if graph_field_no == 1 and graph_wire_type == 2 and index not in live_field_indices:
+                continue
+            if graph_field_no == 13 and graph_wire_type == 2:
+                # Drop internal value_info metadata. The update block has dynamic
+                # group counts, and stale shape hints here trigger ORT warnings.
+                continue
+            finalized_graph.append((graph_field_no, graph_wire_type, graph_value))
+
+        patched_model.append((field_no, wire_type, serialize_fields(finalized_graph)))
+
+    path.write_bytes(serialize_fields(patched_model))
+    return patch_count
 
 
 class FeatureExtractor(torch.nn.Module):
@@ -168,30 +389,6 @@ def _replace_grad_clip(module: torch.nn.Module) -> None:
             _replace_grad_clip(child)
 
 
-def patch_legacy_scatter_sum(path: Path) -> int:
-    """Rewrite legacy scatter_sum subgraphs into dpvo::scatter_sum nodes."""
-    import onnx
-
-    model = onnx.load(path)
-    patch_count = 0
-
-    for node in model.graph.node:
-        replacement_inputs = SCATTER_SUM_PATCHES.get(node.name)
-        if replacement_inputs is None:
-            continue
-
-        del node.input[:]
-        node.input.extend(replacement_inputs)
-        node.op_type = "scatter_sum"
-        node.domain = "dpvo"
-        del node.attribute[:]
-        node.attribute.extend([onnx.helper.make_attribute("dim", 1)])
-        patch_count += 1
-
-    onnx.save(model, path)
-    return patch_count
-
-
 def export_feature(model: VONet, out_dir: Path, height: int, width: int, opset: int) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     feature = FeatureExtractor(model).cpu().eval()
@@ -242,7 +439,7 @@ def export_update(model: VONet, out_dir: Path, edge_count: int, opset: int) -> t
             "jx": {0: "edges"},
         },
     )
-    patch_count = patch_legacy_scatter_sum(onnx_path)
+    patch_count = finalize_update_model(onnx_path)
     return onnx_path, patch_count
 
 
@@ -314,7 +511,7 @@ def main() -> int:
     if not args.skip_update:
         update_path, patch_count = export_update(model, args.out, args.edges, args.opset)
         print(f"Saved update block ONNX to {update_path}")
-        print(f"Patched {patch_count} scatter_sum node(s) in-place")
+        print(f"Finalized runtime model in-place; patched {patch_count} scatter_sum node(s)")
         print("Update block inputs: net, ctx, corr, ii, jj, kk, ix, jx")
 
     if args.skip_feature and args.skip_update:
