@@ -398,8 +398,9 @@ def build_sequence_data(
         gmap = patchify_single_chw(fmap, centers, radius=1)
         colors = patchify_single_chw(image, 4.0 * (centers + 0.5), radius=0)[:, :, 0, 0]
         grid = build_grid_tensor(feature_height, feature_width)
-        patches = patchify_single_chw(grid, centers, radius=1)
-        patches[:, 2, :, :] = depths.view(-1, 1, 1)
+        patchify_patches = patchify_single_chw(grid, centers, radius=1)
+        geometry_patches = patchify_patches.clone()
+        geometry_patches[:, 2, :, :] = depths.view(-1, 1, 1)
 
         frame_data.append(
             FrameData(
@@ -408,13 +409,13 @@ def build_sequence_data(
                 fmap=fmap.unsqueeze(0).unsqueeze(0),
                 patch_imap=patch_imap,
                 gmap=gmap,
-                patches=patches,
+                patches=patchify_patches,
                 colors=colors,
             )
         )
         fmap1_frames.append(fmap)
         fmap2_frames.append(F.avg_pool2d(fmap.unsqueeze(0), 4, 4).squeeze(0).contiguous())
-        patch_list.append(patches)
+        patch_list.append(geometry_patches)
         gmap_list.append(gmap)
         patch_imap_list.append(patch_imap)
 
