@@ -33,6 +33,7 @@ class TrackerConfig:
     KEYFRAME_THRESH: float
     MOTION_MODEL: str
     MOTION_DAMPING: float
+    BA_ITERATIONS: int
     MIXED_PRECISION: bool
     LOOP_CLOSURE: bool
     BACKEND_THRESH: float
@@ -267,6 +268,7 @@ def build_tracker_config(args: argparse.Namespace) -> TrackerConfig:
         KEYFRAME_THRESH=args.keyframe_thresh,
         MOTION_MODEL=args.motion_model,
         MOTION_DAMPING=args.motion_damping,
+        BA_ITERATIONS=2,
         MIXED_PRECISION=args.mixed_precision,
         LOOP_CLOSURE=False,
         BACKEND_THRESH=64.0,
@@ -566,6 +568,7 @@ def dump_tracker_state(slam: Any, tracker_cfg: TrackerConfig) -> OrderedDict[str
     arrays["state_patch_size"] = scalar_i64(int(slam.P))
     arrays["state_buffer_size"] = scalar_i64(int(tracker_cfg.BUFFER_SIZE))
     arrays["state_tstamps"] = slam.pg.tstamps_[: slam.n].astype(np.int64, copy=False)
+    arrays["state_patch_frames"] = slam.ix[: slam.m].detach().cpu().numpy().astype(np.int64, copy=False)
     arrays["state_poses"] = slam.pg.poses_[: slam.n].detach().cpu().numpy().astype(np.float32, copy=False)
     arrays["state_patches"] = slam.pg.patches_[: slam.n].detach().cpu().numpy().astype(np.float32, copy=False)
     arrays["state_intrinsics"] = slam.pg.intrinsics_[: slam.n].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -668,6 +671,8 @@ def main() -> int:
     slam, poses, tstamps, points, colors, centers_by_frame, bootstrap_depths_by_frame = run_tracker(
         args.weights, frames, intrinsics, tracker_cfg
     )
+    active_tstamps = slam.pg.tstamps_[: slam.n].astype(np.int64, copy=False)
+    active_patch_frames = slam.ix[: slam.m].detach().cpu().numpy().astype(np.int64, copy=False)
     centers_manifest_path = write_centers_manifest(args.output_root, centers_by_frame)
     bootstrap_depth_manifest_path = write_vector_manifest(
         output_root=args.output_root,
@@ -699,6 +704,8 @@ def main() -> int:
             ("input_intrinsics", intrinsics.astype(np.float32, copy=False)),
             ("golden_poses", poses.astype(np.float32, copy=False)),
             ("golden_tstamps", tstamps.astype(np.float64, copy=False)),
+            ("golden_active_tstamps", active_tstamps),
+            ("golden_active_patch_frames", active_patch_frames),
             ("golden_points", points.astype(np.float32, copy=False)),
             ("golden_colors", colors.astype(np.uint8, copy=False)),
             ("golden_pose_count", np.array([poses.shape[0]], dtype=np.int64)),

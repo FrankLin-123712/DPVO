@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOLS_DIR))
 
 from dpvo import projective_ops as pops  # noqa: E402
-from dpvo.ba import BA  # noqa: E402
+from dpvo import fastba  # noqa: E402
 from dpvo.lietorch import SE3  # noqa: E402
 from export_models import (  # noqa: E402
     DIM,
@@ -304,6 +304,54 @@ def tensor_to_numpy(tensor: torch.Tensor, dtype: np.dtype | None = None) -> np.n
     return array
 
 
+def run_fastba_reference(
+    poses: torch.Tensor,
+    patches: torch.Tensor,
+    intrinsics: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    kk: torch.Tensor,
+    fixed_pose_count: int,
+    patches_per_frame: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("Generating runtime BA parity data requires CUDA for dpvo.fastba")
+
+    device = torch.device("cuda")
+    poses_cuda = SE3(poses.unsqueeze(0).to(device=device, dtype=torch.float32))
+    patches_cuda = patches.unsqueeze(0).to(device=device, dtype=torch.float32)
+    intrinsics_cuda = intrinsics.unsqueeze(0).to(device=device, dtype=torch.float32)
+    target_cuda = target.to(device=device, dtype=torch.float32)
+    weight_cuda = weight.to(device=device, dtype=torch.float32)
+    ii_cuda = ii.to(device=device)
+    jj_cuda = jj.to(device=device)
+    kk_cuda = kk.to(device=device)
+    lmbda = torch.as_tensor([1e-4], device=device, dtype=torch.float32)
+
+    fastba.BA(
+        poses_cuda,
+        patches_cuda,
+        intrinsics_cuda,
+        target_cuda,
+        weight_cuda,
+        lmbda,
+        ii_cuda,
+        jj_cuda,
+        kk_cuda,
+        fixed_pose_count,
+        poses.shape[0],
+        M=patches_per_frame,
+        iterations=2,
+        eff_impl=False,
+    )
+    return (
+        poses_cuda.data.squeeze(0).detach().cpu().contiguous(),
+        patches_cuda.squeeze(0).detach().cpu().contiguous(),
+    )
+
+
 def build_sequence_data(
     weights: Path,
     image_paths: list[Path],
@@ -401,19 +449,17 @@ def build_sequence_data(
     fixed_pose_count = torch.tensor([1], dtype=torch.int64)
 
     with torch.inference_mode():
-        ba_poses, ba_patches = BA(
-            poses_se3,
-            patches_batched,
-            intrinsics_batched,
+        ba_poses, ba_patches = run_fastba_reference(
+            poses,
+            patches,
+            intrinsics,
             target,
             update_weight,
-            1e-4,
             ii,
             jj,
             kk,
-            bounds.tolist(),
-            ep=1.0,
-            fixedp=int(fixed_pose_count.item()),
+            fixed_pose_count=int(fixed_pose_count.item()),
+            patches_per_frame=patches_per_frame,
         )
 
     return SequenceData(
@@ -434,8 +480,8 @@ def build_sequence_data(
         update_net=update_net,
         update_delta=update_delta,
         update_weight=update_weight,
-        ba_poses=ba_poses.data.squeeze(0).contiguous(),
-        ba_patches=ba_patches.squeeze(0).contiguous(),
+        ba_poses=ba_poses,
+        ba_patches=ba_patches,
         bounds=bounds,
         fixed_pose_count=fixed_pose_count,
     )
