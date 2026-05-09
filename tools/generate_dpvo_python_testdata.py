@@ -469,7 +469,16 @@ def run_tracker(
     frames: list[np.ndarray],
     intrinsics: np.ndarray,
     tracker_cfg: TrackerConfig,
-) -> tuple[Any, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
+) -> tuple[
+    Any,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[np.ndarray],
+    list[np.ndarray],
+    list[dict[str, np.ndarray]],
+]:
     try:
         import torch
     except ModuleNotFoundError as exc:
@@ -484,9 +493,11 @@ def run_tracker(
     slam = DPVO(tracker_cfg, str(weights), ht=height, wd=width, viz=False)
     centers_by_frame: list[np.ndarray] = []
     bootstrap_depths_by_frame: list[np.ndarray | None] = [None] * len(frames)
+    update_trace: list[dict[str, np.ndarray]] = []
 
     original_patchify_forward = slam.network.patchify.forward
     original_rand_like = torch.rand_like
+    original_update = slam.update
     current_frame_index: int | None = None
 
     def recording_patchify_forward(images, patches_per_image=80, disps=None, centroid_sel_strat="RANDOM", return_color=False):
@@ -520,8 +531,29 @@ def run_tracker(
             )
         return result
 
+    def recording_update(*args: Any, **kwargs: Any) -> Any:
+        result = original_update(*args, **kwargs)
+        if hasattr(slam.pg, "target") and hasattr(slam.pg, "weight"):
+            target = slam.pg.target.detach().cpu().numpy().astype(np.float32, copy=False)
+            weight = slam.pg.weight.detach().cpu().numpy().astype(np.float32, copy=False)
+            ii = slam.pg.ii.detach().cpu().numpy().astype(np.int64, copy=False)
+            jj = slam.pg.jj.detach().cpu().numpy().astype(np.int64, copy=False)
+            kk = slam.pg.kk.detach().cpu().numpy().astype(np.int64, copy=False)
+            if target.ndim == 3 and weight.ndim == 3 and target.shape[1] == ii.shape[0]:
+                update_trace.append(
+                    {
+                        "ii": ii.copy(),
+                        "jj": jj.copy(),
+                        "kk": kk.copy(),
+                        "target": target.copy(),
+                        "weight": weight.copy(),
+                    }
+                )
+        return result
+
     slam.network.patchify.forward = recording_patchify_forward
     torch.rand_like = recording_rand_like
+    slam.update = recording_update
 
     try:
         with torch.no_grad():
@@ -536,6 +568,7 @@ def run_tracker(
     finally:
         slam.network.patchify.forward = original_patchify_forward
         torch.rand_like = original_rand_like
+        slam.update = original_update
 
     points = slam.pg.points_.detach().cpu().numpy()[: slam.m].astype(np.float32, copy=False)
     colors = slam.pg.colors_.view(-1, 3).detach().cpu().numpy()[: slam.m].astype(np.uint8, copy=False)
@@ -554,6 +587,7 @@ def run_tracker(
         colors,
         centers_by_frame,
         [depths for depths in bootstrap_depths_by_frame if depths is not None],
+        update_trace,
     )
 
 
@@ -575,6 +609,8 @@ def dump_tracker_state(slam: Any, tracker_cfg: TrackerConfig) -> OrderedDict[str
     arrays["state_colors"] = slam.pg.colors_[: slam.n].detach().cpu().numpy().astype(np.uint8, copy=False)
     arrays["state_points"] = slam.pg.points_[: slam.m].detach().cpu().numpy().astype(np.float32, copy=False)
     arrays["state_net"] = slam.pg.net.detach().cpu().numpy().astype(np.float32, copy=False)
+    arrays["state_target"] = slam.pg.target.detach().cpu().numpy().astype(np.float32, copy=False)
+    arrays["state_weight"] = slam.pg.weight.detach().cpu().numpy().astype(np.float32, copy=False)
     arrays["state_ii"] = slam.pg.ii.detach().cpu().numpy().astype(np.int64, copy=False)
     arrays["state_jj"] = slam.pg.jj.detach().cpu().numpy().astype(np.int64, copy=False)
     arrays["state_kk"] = slam.pg.kk.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -598,6 +634,38 @@ def dump_tracker_state(slam: Any, tracker_cfg: TrackerConfig) -> OrderedDict[str
         arrays["state_delta_parent"] = np.zeros((0,), dtype=np.int64)
         arrays["state_delta_pose"] = np.zeros((0, 7), dtype=np.float32)
 
+    return arrays
+
+
+def dump_update_trace(update_trace: list[dict[str, np.ndarray]]) -> OrderedDict[str, np.ndarray]:
+    arrays: OrderedDict[str, np.ndarray] = OrderedDict()
+    edge_counts = np.array([entry["ii"].shape[0] for entry in update_trace], dtype=np.int64)
+    edge_offsets = np.zeros((len(update_trace) + 1,), dtype=np.int64)
+    if edge_counts.size:
+        edge_offsets[1:] = np.cumsum(edge_counts, dtype=np.int64)
+    total_edges = int(edge_offsets[-1])
+
+    arrays["update_trace_count"] = np.array([len(update_trace)], dtype=np.int64)
+    arrays["update_trace_edge_counts"] = edge_counts
+    arrays["update_trace_edge_offsets"] = edge_offsets
+
+    if total_edges == 0:
+        arrays["update_trace_ii"] = np.zeros((0,), dtype=np.int64)
+        arrays["update_trace_jj"] = np.zeros((0,), dtype=np.int64)
+        arrays["update_trace_kk"] = np.zeros((0,), dtype=np.int64)
+        arrays["update_trace_target"] = np.zeros((1, 0, 2), dtype=np.float32)
+        arrays["update_trace_weight"] = np.zeros((1, 0, 2), dtype=np.float32)
+        return arrays
+
+    arrays["update_trace_ii"] = np.concatenate([entry["ii"] for entry in update_trace]).astype(np.int64, copy=False)
+    arrays["update_trace_jj"] = np.concatenate([entry["jj"] for entry in update_trace]).astype(np.int64, copy=False)
+    arrays["update_trace_kk"] = np.concatenate([entry["kk"] for entry in update_trace]).astype(np.int64, copy=False)
+    arrays["update_trace_target"] = np.concatenate(
+        [entry["target"] for entry in update_trace], axis=1
+    ).astype(np.float32, copy=False)
+    arrays["update_trace_weight"] = np.concatenate(
+        [entry["weight"] for entry in update_trace], axis=1
+    ).astype(np.float32, copy=False)
     return arrays
 
 
@@ -668,7 +736,16 @@ def main() -> int:
         max_long_edge=args.max_long_edge,
     )
 
-    slam, poses, tstamps, points, colors, centers_by_frame, bootstrap_depths_by_frame = run_tracker(
+    (
+        slam,
+        poses,
+        tstamps,
+        points,
+        colors,
+        centers_by_frame,
+        bootstrap_depths_by_frame,
+        update_trace,
+    ) = run_tracker(
         args.weights, frames, intrinsics, tracker_cfg
     )
     active_tstamps = slam.pg.tstamps_[: slam.n].astype(np.int64, copy=False)
@@ -715,6 +792,7 @@ def main() -> int:
 
     if args.dump_state:
         tensors.update(dump_tracker_state(slam, tracker_cfg))
+        tensors.update(dump_update_trace(update_trace))
 
     write_case(golden_dir, tensors)
     write_tum_trajectory(golden_dir / "golden_trajectory_tum.txt", poses, tstamps)
@@ -736,7 +814,7 @@ def main() -> int:
         )
     )
     if args.dump_state:
-        print("Included final DPVO patch-graph state tensors")
+        print(f"Included final DPVO patch-graph state tensors and {len(update_trace)} update trace snapshots")
     return 0
 
 
