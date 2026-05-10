@@ -539,6 +539,15 @@ def run_tracker(
             ii = slam.pg.ii.detach().cpu().numpy().astype(np.int64, copy=False)
             jj = slam.pg.jj.detach().cpu().numpy().astype(np.int64, copy=False)
             kk = slam.pg.kk.detach().cpu().numpy().astype(np.int64, copy=False)
+            poses = slam.pg.poses_[: slam.n].detach().cpu().numpy().astype(np.float32, copy=False)
+            patch_depths = (
+                slam.pg.patches_[: slam.n, :, 2]
+                .reshape(-1, slam.P, slam.P)[: slam.m]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
             if target.ndim == 3 and weight.ndim == 3 and target.shape[1] == ii.shape[0]:
                 update_trace.append(
                     {
@@ -547,6 +556,8 @@ def run_tracker(
                         "kk": kk.copy(),
                         "target": target.copy(),
                         "weight": weight.copy(),
+                        "post_ba_poses": poses.copy(),
+                        "post_ba_patch_depths": patch_depths.copy(),
                     }
                 )
         return result
@@ -655,6 +666,12 @@ def dump_update_trace(update_trace: list[dict[str, np.ndarray]]) -> OrderedDict[
         arrays["update_trace_kk"] = np.zeros((0,), dtype=np.int64)
         arrays["update_trace_target"] = np.zeros((1, 0, 2), dtype=np.float32)
         arrays["update_trace_weight"] = np.zeros((1, 0, 2), dtype=np.float32)
+        arrays["update_trace_post_ba_pose_counts"] = np.zeros((0,), dtype=np.int64)
+        arrays["update_trace_post_ba_pose_offsets"] = np.zeros((1,), dtype=np.int64)
+        arrays["update_trace_post_ba_patch_counts"] = np.zeros((0,), dtype=np.int64)
+        arrays["update_trace_post_ba_patch_offsets"] = np.zeros((1,), dtype=np.int64)
+        arrays["update_trace_post_ba_poses"] = np.zeros((0, 7), dtype=np.float32)
+        arrays["update_trace_post_ba_patch_depths"] = np.zeros((0, 3, 3), dtype=np.float32)
         return arrays
 
     arrays["update_trace_ii"] = np.concatenate([entry["ii"] for entry in update_trace]).astype(np.int64, copy=False)
@@ -665,6 +682,22 @@ def dump_update_trace(update_trace: list[dict[str, np.ndarray]]) -> OrderedDict[
     ).astype(np.float32, copy=False)
     arrays["update_trace_weight"] = np.concatenate(
         [entry["weight"] for entry in update_trace], axis=1
+    ).astype(np.float32, copy=False)
+    pose_counts = np.array([entry["post_ba_poses"].shape[0] for entry in update_trace], dtype=np.int64)
+    pose_offsets = np.zeros((len(update_trace) + 1,), dtype=np.int64)
+    pose_offsets[1:] = np.cumsum(pose_counts, dtype=np.int64)
+    patch_counts = np.array([entry["post_ba_patch_depths"].shape[0] for entry in update_trace], dtype=np.int64)
+    patch_offsets = np.zeros((len(update_trace) + 1,), dtype=np.int64)
+    patch_offsets[1:] = np.cumsum(patch_counts, dtype=np.int64)
+    arrays["update_trace_post_ba_pose_counts"] = pose_counts
+    arrays["update_trace_post_ba_pose_offsets"] = pose_offsets
+    arrays["update_trace_post_ba_patch_counts"] = patch_counts
+    arrays["update_trace_post_ba_patch_offsets"] = patch_offsets
+    arrays["update_trace_post_ba_poses"] = np.concatenate(
+        [entry["post_ba_poses"] for entry in update_trace], axis=0
+    ).astype(np.float32, copy=False)
+    arrays["update_trace_post_ba_patch_depths"] = np.concatenate(
+        [entry["post_ba_patch_depths"] for entry in update_trace], axis=0
     ).astype(np.float32, copy=False)
     return arrays
 
