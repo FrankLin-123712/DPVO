@@ -533,6 +533,12 @@ def compute_ba_debug_trace(
     debug_q: list[np.ndarray] = []
     debug_w: list[np.ndarray] = []
     debug_dz: list[np.ndarray] = []
+    debug_coords_center: list[np.ndarray] = []
+    debug_residual: list[np.ndarray] = []
+    debug_jz: list[np.ndarray] = []
+    debug_weight: list[np.ndarray] = []
+    debug_c_contrib: list[np.ndarray] = []
+    debug_w_contrib: list[np.ndarray] = []
 
     for iteration in range(iterations):
         kx, ku = torch.unique(kk_flat, sorted=True, return_inverse=True)
@@ -566,6 +572,8 @@ def compute_ba_debug_trace(
         C = torch.zeros((point_count,), device=device, dtype=torch.float32)
         v = torch.zeros((pose_dim,), device=device, dtype=torch.float32)
         w_vec = torch.zeros((point_count,), device=device, dtype=torch.float32)
+        c_contrib = torch.zeros((int(ii_flat.numel()), 2), device=device, dtype=torch.float32)
+        w_contrib = torch.zeros_like(c_contrib)
 
         for edge in range(int(ii_flat.numel())):
             if not bool(in_bounds[edge].item()):
@@ -594,8 +602,12 @@ def compute_ba_debug_trace(
                     j_slice = slice(j_frame * 6, (j_frame + 1) * 6)
                     B[i_slice, j_slice] += obs_weight * torch.outer(ji, jj_row)
                     B[j_slice, i_slice] += obs_weight * torch.outer(jj_row, ji)
-                C[point_index] += obs_weight * obs_jz * obs_jz
-                w_vec[point_index] += obs_weight * obs_jz * obs_residual
+                obs_c_contrib = obs_weight * obs_jz * obs_jz
+                obs_w_contrib = obs_weight * obs_jz * obs_residual
+                c_contrib[edge, obs] = obs_c_contrib
+                w_contrib[edge, obs] = obs_w_contrib
+                C[point_index] += obs_c_contrib
+                w_vec[point_index] += obs_w_contrib
 
         Q = 1.0 / (C + 1e-4)
         if pose_dim > 0:
@@ -639,6 +651,12 @@ def compute_ba_debug_trace(
         debug_q.append(selected_q.detach().cpu().numpy().astype(np.float32, copy=True))
         debug_w.append(selected_w.detach().cpu().numpy().astype(np.float32, copy=True))
         debug_dz.append(selected_dz.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_coords_center.append(coords_center.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_residual.append(residual.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_jz.append(Jz.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_weight.append(weight_flat.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_c_contrib.append(c_contrib.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_w_contrib.append(w_contrib.detach().cpu().numpy().astype(np.float32, copy=True))
 
         patches_flat = patches_debug.reshape(-1, patches_debug.shape[-3], patches_debug.shape[-2], patches_debug.shape[-1])
         for point_index, patch_index in enumerate(kx.tolist()):
@@ -659,6 +677,12 @@ def compute_ba_debug_trace(
         "ba_debug_q": np.stack(debug_q, axis=0).astype(np.float32, copy=False),
         "ba_debug_w": np.stack(debug_w, axis=0).astype(np.float32, copy=False),
         "ba_debug_dz": np.stack(debug_dz, axis=0).astype(np.float32, copy=False),
+        "ba_debug_coords_center": np.stack(debug_coords_center, axis=0).astype(np.float32, copy=False),
+        "ba_debug_residual": np.stack(debug_residual, axis=0).astype(np.float32, copy=False),
+        "ba_debug_jz": np.stack(debug_jz, axis=0).astype(np.float32, copy=False),
+        "ba_debug_weight": np.stack(debug_weight, axis=0).astype(np.float32, copy=False),
+        "ba_debug_c_contrib": np.stack(debug_c_contrib, axis=0).astype(np.float32, copy=False),
+        "ba_debug_w_contrib": np.stack(debug_w_contrib, axis=0).astype(np.float32, copy=False),
     }
 
 
@@ -921,10 +945,16 @@ def append_ba_debug_trace(
         offsets[1:] = np.cumsum(counts, dtype=np.int64)
     total_rows = int(offsets[-1])
     patch_width = 0
+    edge_width = 0
     for entry in update_trace:
         patch_indices = entry.get("ba_debug_patch_indices")
         if patch_indices is not None and patch_indices.ndim == 2 and patch_indices.shape[1] > 0:
             patch_width = int(patch_indices.shape[1])
+            break
+    for entry in update_trace:
+        edge_values = entry.get("ba_debug_coords_center")
+        if edge_values is not None and edge_values.ndim == 3 and edge_values.shape[1] > 0:
+            edge_width = int(edge_values.shape[1])
             break
 
     arrays["update_trace_ba_debug_counts"] = counts
@@ -936,6 +966,12 @@ def append_ba_debug_trace(
         arrays["update_trace_ba_debug_q"] = np.zeros((0, patch_width), dtype=np.float32)
         arrays["update_trace_ba_debug_w"] = np.zeros((0, patch_width), dtype=np.float32)
         arrays["update_trace_ba_debug_dz"] = np.zeros((0, patch_width), dtype=np.float32)
+        arrays["update_trace_ba_debug_coords_center"] = np.zeros((0, edge_width, 2), dtype=np.float32)
+        arrays["update_trace_ba_debug_residual"] = np.zeros((0, edge_width, 2), dtype=np.float32)
+        arrays["update_trace_ba_debug_jz"] = np.zeros((0, edge_width, 2), dtype=np.float32)
+        arrays["update_trace_ba_debug_weight"] = np.zeros((0, edge_width, 2), dtype=np.float32)
+        arrays["update_trace_ba_debug_c_contrib"] = np.zeros((0, edge_width, 2), dtype=np.float32)
+        arrays["update_trace_ba_debug_w_contrib"] = np.zeros((0, edge_width, 2), dtype=np.float32)
         return
 
     arrays["update_trace_ba_debug_iterations"] = np.concatenate(
@@ -958,6 +994,21 @@ def append_ba_debug_trace(
         arrays[tensor_name] = np.concatenate(
             [
                 entry.get(source_name, np.zeros((0, patch_width), dtype=np.float32))
+                for entry in update_trace
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+    for source_name, tensor_name in [
+        ("ba_debug_coords_center", "update_trace_ba_debug_coords_center"),
+        ("ba_debug_residual", "update_trace_ba_debug_residual"),
+        ("ba_debug_jz", "update_trace_ba_debug_jz"),
+        ("ba_debug_weight", "update_trace_ba_debug_weight"),
+        ("ba_debug_c_contrib", "update_trace_ba_debug_c_contrib"),
+        ("ba_debug_w_contrib", "update_trace_ba_debug_w_contrib"),
+    ]:
+        arrays[tensor_name] = np.concatenate(
+            [
+                entry.get(source_name, np.zeros((0, edge_width, 2), dtype=np.float32))
                 for entry in update_trace
             ],
             axis=0,
