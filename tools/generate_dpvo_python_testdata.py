@@ -188,7 +188,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also save final DPVO patch-graph state tensors for deeper parity debugging.",
     )
+    parser.add_argument(
+        "--ba-debug-update-index",
+        type=int,
+        default=0,
+        help="Update-trace index whose BA C/Q/w/dZ internals should be dumped.",
+    )
+    parser.add_argument(
+        "--ba-debug-patches",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated absolute patch indices to dump for BA debug. "
+            "Empty means all patches; set to 'none' to disable."
+        ),
+    )
     return parser.parse_args()
+
+
+def parse_ba_debug_patches(value: str) -> list[int] | None:
+    value = value.strip()
+    if value.lower() in {"none", "off", "false", "disabled"}:
+        return None
+    if not value:
+        return []
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def collect_image_paths(image_dir: Path, frame_start: int, frame_count: int, frame_step: int) -> list[Path]:
@@ -464,11 +488,187 @@ def configure_determinism(seed: int) -> None:
         torch.backends.cudnn.deterministic = True
 
 
+def compute_ba_debug_trace(
+    poses: Any,
+    patches: Any,
+    intrinsics: Any,
+    target: Any,
+    weight: Any,
+    ii: Any,
+    jj: Any,
+    kk: Any,
+    t0: int,
+    t1: int,
+    iterations: int,
+    patch_filter: list[int],
+) -> dict[str, np.ndarray]:
+    import torch
+
+    from dpvo import projective_ops as pops
+    from dpvo.lietorch import SE3
+
+    poses_debug = poses.detach().clone().float()
+    patches_debug = patches.detach().clone().float()
+    intrinsics_debug = intrinsics.detach().clone().float()
+    target_flat = target.detach().reshape(-1, 2).float()
+    weight_flat = weight.detach().reshape(-1, 2).float()
+    ii_flat = ii.detach().reshape(-1).long()
+    jj_flat = jj.detach().reshape(-1).long()
+    kk_flat = kk.detach().reshape(-1).long()
+    t0 = int(t0)
+    t1 = int(t1)
+    iterations = int(iterations)
+
+    device = poses_debug.device
+    fx, fy, cx, cy = intrinsics_debug.reshape(-1, 4)[0]
+    del fx, fy
+    bound_min_x = torch.tensor(-64.0, device=device)
+    bound_min_y = torch.tensor(-64.0, device=device)
+    bound_max_x = 2.0 * cx + 64.0
+    bound_max_y = 2.0 * cy + 64.0
+
+    debug_iterations: list[np.ndarray] = []
+    debug_patch_indices: list[np.ndarray] = []
+    debug_c: list[np.ndarray] = []
+    debug_q: list[np.ndarray] = []
+    debug_w: list[np.ndarray] = []
+    debug_dz: list[np.ndarray] = []
+
+    for iteration in range(iterations):
+        kx, ku = torch.unique(kk_flat, sorted=True, return_inverse=True)
+        pose_count = max(t1 - t0, 0)
+        point_count = int(kx.numel())
+        pose_dim = pose_count * 6
+
+        coords, valid, (Ji, Jj, Jz) = pops.transform(
+            SE3(poses_debug), patches_debug, intrinsics_debug, ii_flat, jj_flat, kk_flat, jacobian=True
+        )
+        patch_size = coords.shape[2]
+        coords_center = coords[:, :, patch_size // 2, patch_size // 2, :].reshape(-1, 2)
+        residual = target_flat - coords_center
+        residual_norm = torch.linalg.norm(residual, dim=-1)
+        valid_flat = valid.reshape(-1) > 0.5
+        in_bounds = (
+            (residual_norm < 128.0)
+            & valid_flat
+            & (coords_center[:, 0] > bound_min_x)
+            & (coords_center[:, 1] > bound_min_y)
+            & (coords_center[:, 0] < bound_max_x)
+            & (coords_center[:, 1] < bound_max_y)
+        )
+
+        Ji = Ji.reshape(-1, 2, 6).float()
+        Jj = Jj.reshape(-1, 2, 6).float()
+        Jz = Jz.reshape(-1, 2).float()
+
+        B = torch.zeros((pose_dim, pose_dim), device=device, dtype=torch.float32)
+        E = torch.zeros((pose_dim, point_count), device=device, dtype=torch.float32)
+        C = torch.zeros((point_count,), device=device, dtype=torch.float32)
+        v = torch.zeros((pose_dim,), device=device, dtype=torch.float32)
+        w_vec = torch.zeros((point_count,), device=device, dtype=torch.float32)
+
+        for edge in range(int(ii_flat.numel())):
+            if not bool(in_bounds[edge].item()):
+                continue
+            point_index = int(ku[edge].item())
+            i_frame = int(ii_flat[edge].item()) - t0
+            j_frame = int(jj_flat[edge].item()) - t0
+            for obs in range(2):
+                obs_weight = weight_flat[edge, obs]
+                obs_residual = residual[edge, obs]
+                obs_jz = Jz[edge, obs]
+                ji = Ji[edge, obs]
+                jj_row = Jj[edge, obs]
+                if i_frame >= 0:
+                    i_slice = slice(i_frame * 6, (i_frame + 1) * 6)
+                    B[i_slice, i_slice] += obs_weight * torch.outer(ji, ji)
+                    E[i_slice, point_index] += obs_weight * ji * obs_jz
+                    v[i_slice] += obs_weight * ji * obs_residual
+                if j_frame >= 0:
+                    j_slice = slice(j_frame * 6, (j_frame + 1) * 6)
+                    B[j_slice, j_slice] += obs_weight * torch.outer(jj_row, jj_row)
+                    E[j_slice, point_index] += obs_weight * jj_row * obs_jz
+                    v[j_slice] += obs_weight * jj_row * obs_residual
+                if i_frame >= 0 and j_frame >= 0:
+                    i_slice = slice(i_frame * 6, (i_frame + 1) * 6)
+                    j_slice = slice(j_frame * 6, (j_frame + 1) * 6)
+                    B[i_slice, j_slice] += obs_weight * torch.outer(ji, jj_row)
+                    B[j_slice, i_slice] += obs_weight * torch.outer(jj_row, ji)
+                C[point_index] += obs_weight * obs_jz * obs_jz
+                w_vec[point_index] += obs_weight * obs_jz * obs_residual
+
+        Q = 1.0 / (C + 1e-4)
+        if pose_dim > 0:
+            EQ = E * Q.reshape(1, -1)
+            S = B - torch.matmul(EQ, E.transpose(0, 1))
+            y_vec = v - torch.matmul(EQ, w_vec.reshape(-1, 1)).reshape(-1)
+            diagonal = torch.arange(pose_dim, device=device)
+            S[diagonal, diagonal] = S[diagonal, diagonal] + 1.0 + 1e-4 * S[diagonal, diagonal]
+            chol, info = torch.linalg.cholesky_ex(S)
+            if bool(torch.any(info != 0).item()):
+                raise RuntimeError(f"BA debug cholesky failed at iteration {iteration}: info={info.detach().cpu().tolist()}")
+            dX = torch.cholesky_solve(y_vec.reshape(-1, 1), chol).reshape(-1)
+            dZ = Q * (w_vec - torch.matmul(E.transpose(0, 1), dX.reshape(-1, 1)).reshape(-1))
+        else:
+            dX = torch.zeros((0,), device=device, dtype=torch.float32)
+            dZ = Q * w_vec
+
+        selected_patch_indices = (
+            torch.tensor(patch_filter, device=device, dtype=torch.long)
+            if patch_filter
+            else kx
+        )
+        selected_c = torch.zeros((int(selected_patch_indices.numel()),), device=device, dtype=torch.float32)
+        selected_q = torch.zeros_like(selected_c)
+        selected_w = torch.zeros_like(selected_c)
+        selected_dz = torch.zeros_like(selected_c)
+        for selected_index, patch_index_value in enumerate(selected_patch_indices.tolist()):
+            patch_index = int(patch_index_value)
+            matches = torch.nonzero(kx == int(patch_index), as_tuple=False).reshape(-1)
+            if int(matches.numel()) == 0:
+                continue
+            point_index = int(matches[0].item())
+            selected_c[selected_index] = C[point_index]
+            selected_q[selected_index] = Q[point_index]
+            selected_w[selected_index] = w_vec[point_index]
+            selected_dz[selected_index] = dZ[point_index]
+
+        debug_iterations.append(np.array(iteration, dtype=np.int64))
+        debug_patch_indices.append(selected_patch_indices.detach().cpu().numpy().astype(np.int64, copy=True))
+        debug_c.append(selected_c.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_q.append(selected_q.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_w.append(selected_w.detach().cpu().numpy().astype(np.float32, copy=True))
+        debug_dz.append(selected_dz.detach().cpu().numpy().astype(np.float32, copy=True))
+
+        patches_flat = patches_debug.reshape(-1, patches_debug.shape[-3], patches_debug.shape[-2], patches_debug.shape[-1])
+        for point_index, patch_index in enumerate(kx.tolist()):
+            depth = patches_flat[int(patch_index), 2, 0, 0] + dZ[point_index]
+            depth = torch.where(depth > 20.0, torch.ones_like(depth), depth)
+            depth = torch.clamp(depth, min=1e-4)
+            patches_flat[int(patch_index), 2, :, :] = depth
+
+        if pose_dim > 0:
+            dx_full = torch.zeros((*poses_debug.shape[:-1], 6), device=device, dtype=torch.float32)
+            dx_full.reshape(-1, 6)[t0:t1, :] = dX.reshape(pose_count, 6)
+            poses_debug = SE3(poses_debug).retr(dx_full).data.float()
+
+    return {
+        "ba_debug_iterations": np.stack(debug_iterations, axis=0).astype(np.int64, copy=False),
+        "ba_debug_patch_indices": np.stack(debug_patch_indices, axis=0).astype(np.int64, copy=False),
+        "ba_debug_c": np.stack(debug_c, axis=0).astype(np.float32, copy=False),
+        "ba_debug_q": np.stack(debug_q, axis=0).astype(np.float32, copy=False),
+        "ba_debug_w": np.stack(debug_w, axis=0).astype(np.float32, copy=False),
+        "ba_debug_dz": np.stack(debug_dz, axis=0).astype(np.float32, copy=False),
+    }
+
+
 def run_tracker(
     weights: Path,
     frames: list[np.ndarray],
     intrinsics: np.ndarray,
     tracker_cfg: TrackerConfig,
+    ba_debug_update_index: int,
+    ba_debug_patches: list[int] | None,
 ) -> tuple[
     Any,
     np.ndarray,
@@ -484,6 +684,7 @@ def run_tracker(
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError("PyTorch is required to run the Python DPVO tracker") from exc
 
+    import dpvo.dpvo as dpvo_module
     from dpvo.dpvo import DPVO
 
     if not torch.cuda.is_available():
@@ -494,10 +695,13 @@ def run_tracker(
     centers_by_frame: list[np.ndarray] = []
     bootstrap_depths_by_frame: list[np.ndarray | None] = [None] * len(frames)
     update_trace: list[dict[str, np.ndarray]] = []
+    ba_debug_by_update_index: dict[int, dict[str, np.ndarray]] = {}
+    ba_call_index = 0
 
     original_patchify_forward = slam.network.patchify.forward
     original_rand_like = torch.rand_like
     original_update = slam.update
+    original_fastba_ba = dpvo_module.fastba.BA
     current_frame_index: int | None = None
 
     def recording_patchify_forward(images, patches_per_image=80, disps=None, centroid_sel_strat="RANDOM", return_color=False):
@@ -531,6 +735,60 @@ def run_tracker(
             )
         return result
 
+    def recording_fastba_ba(
+        poses,
+        patches,
+        intrinsics,
+        target,
+        weight,
+        lmbda,
+        ii,
+        jj,
+        kk,
+        t0,
+        t1,
+        M,
+        iterations,
+        eff_impl=False,
+    ) -> Any:
+        nonlocal ba_call_index
+        current_update_index = ba_call_index
+        ba_call_index += 1
+        if ba_debug_patches is not None and current_update_index == ba_debug_update_index:
+            try:
+                ba_debug_by_update_index[current_update_index] = compute_ba_debug_trace(
+                    poses=poses,
+                    patches=patches,
+                    intrinsics=intrinsics,
+                    target=target,
+                    weight=weight,
+                    ii=ii,
+                    jj=jj,
+                    kk=kk,
+                    t0=t0,
+                    t1=t1,
+                    iterations=iterations,
+                    patch_filter=ba_debug_patches,
+                )
+            except Exception as exc:
+                print(f"Warning BA debug capture failed for update {current_update_index}: {exc}")
+        return original_fastba_ba(
+            poses,
+            patches,
+            intrinsics,
+            target,
+            weight,
+            lmbda,
+            ii,
+            jj,
+            kk,
+            t0,
+            t1,
+            M=M,
+            iterations=iterations,
+            eff_impl=eff_impl,
+        )
+
     def recording_update(*args: Any, **kwargs: Any) -> Any:
         result = original_update(*args, **kwargs)
         if hasattr(slam.pg, "target") and hasattr(slam.pg, "weight"):
@@ -549,22 +807,23 @@ def run_tracker(
                 .astype(np.float32, copy=False)
             )
             if target.ndim == 3 and weight.ndim == 3 and target.shape[1] == ii.shape[0]:
-                update_trace.append(
-                    {
-                        "ii": ii.copy(),
-                        "jj": jj.copy(),
-                        "kk": kk.copy(),
-                        "target": target.copy(),
-                        "weight": weight.copy(),
-                        "post_ba_poses": poses.copy(),
-                        "post_ba_patch_depths": patch_depths.copy(),
-                    }
-                )
+                entry = {
+                    "ii": ii.copy(),
+                    "jj": jj.copy(),
+                    "kk": kk.copy(),
+                    "target": target.copy(),
+                    "weight": weight.copy(),
+                    "post_ba_poses": poses.copy(),
+                    "post_ba_patch_depths": patch_depths.copy(),
+                }
+                entry.update(ba_debug_by_update_index.get(len(update_trace), {}))
+                update_trace.append(entry)
         return result
 
     slam.network.patchify.forward = recording_patchify_forward
     torch.rand_like = recording_rand_like
     slam.update = recording_update
+    dpvo_module.fastba.BA = recording_fastba_ba
 
     try:
         with torch.no_grad():
@@ -580,6 +839,7 @@ def run_tracker(
         slam.network.patchify.forward = original_patchify_forward
         torch.rand_like = original_rand_like
         slam.update = original_update
+        dpvo_module.fastba.BA = original_fastba_ba
 
     points = slam.pg.points_.detach().cpu().numpy()[: slam.m].astype(np.float32, copy=False)
     colors = slam.pg.colors_.view(-1, 3).detach().cpu().numpy()[: slam.m].astype(np.uint8, copy=False)
@@ -648,6 +908,62 @@ def dump_tracker_state(slam: Any, tracker_cfg: TrackerConfig) -> OrderedDict[str
     return arrays
 
 
+def append_ba_debug_trace(
+    arrays: OrderedDict[str, np.ndarray],
+    update_trace: list[dict[str, np.ndarray]],
+) -> None:
+    counts = np.array(
+        [entry.get("ba_debug_iterations", np.zeros((0,), dtype=np.int64)).shape[0] for entry in update_trace],
+        dtype=np.int64,
+    )
+    offsets = np.zeros((len(update_trace) + 1,), dtype=np.int64)
+    if counts.size:
+        offsets[1:] = np.cumsum(counts, dtype=np.int64)
+    total_rows = int(offsets[-1])
+    patch_width = 0
+    for entry in update_trace:
+        patch_indices = entry.get("ba_debug_patch_indices")
+        if patch_indices is not None and patch_indices.ndim == 2 and patch_indices.shape[1] > 0:
+            patch_width = int(patch_indices.shape[1])
+            break
+
+    arrays["update_trace_ba_debug_counts"] = counts
+    arrays["update_trace_ba_debug_offsets"] = offsets
+    if total_rows == 0:
+        arrays["update_trace_ba_debug_iterations"] = np.zeros((0,), dtype=np.int64)
+        arrays["update_trace_ba_debug_patch_indices"] = np.zeros((0, patch_width), dtype=np.int64)
+        arrays["update_trace_ba_debug_c"] = np.zeros((0, patch_width), dtype=np.float32)
+        arrays["update_trace_ba_debug_q"] = np.zeros((0, patch_width), dtype=np.float32)
+        arrays["update_trace_ba_debug_w"] = np.zeros((0, patch_width), dtype=np.float32)
+        arrays["update_trace_ba_debug_dz"] = np.zeros((0, patch_width), dtype=np.float32)
+        return
+
+    arrays["update_trace_ba_debug_iterations"] = np.concatenate(
+        [entry.get("ba_debug_iterations", np.zeros((0,), dtype=np.int64)) for entry in update_trace],
+        axis=0,
+    ).astype(np.int64, copy=False)
+    arrays["update_trace_ba_debug_patch_indices"] = np.concatenate(
+        [
+            entry.get("ba_debug_patch_indices", np.zeros((0, patch_width), dtype=np.int64))
+            for entry in update_trace
+        ],
+        axis=0,
+    ).astype(np.int64, copy=False)
+    for source_name, tensor_name in [
+        ("ba_debug_c", "update_trace_ba_debug_c"),
+        ("ba_debug_q", "update_trace_ba_debug_q"),
+        ("ba_debug_w", "update_trace_ba_debug_w"),
+        ("ba_debug_dz", "update_trace_ba_debug_dz"),
+    ]:
+        arrays[tensor_name] = np.concatenate(
+            [
+                entry.get(source_name, np.zeros((0, patch_width), dtype=np.float32))
+                for entry in update_trace
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+
 def dump_update_trace(update_trace: list[dict[str, np.ndarray]]) -> OrderedDict[str, np.ndarray]:
     arrays: OrderedDict[str, np.ndarray] = OrderedDict()
     edge_counts = np.array([entry["ii"].shape[0] for entry in update_trace], dtype=np.int64)
@@ -672,6 +988,7 @@ def dump_update_trace(update_trace: list[dict[str, np.ndarray]]) -> OrderedDict[
         arrays["update_trace_post_ba_patch_offsets"] = np.zeros((1,), dtype=np.int64)
         arrays["update_trace_post_ba_poses"] = np.zeros((0, 7), dtype=np.float32)
         arrays["update_trace_post_ba_patch_depths"] = np.zeros((0, 3, 3), dtype=np.float32)
+        append_ba_debug_trace(arrays, update_trace)
         return arrays
 
     arrays["update_trace_ii"] = np.concatenate([entry["ii"] for entry in update_trace]).astype(np.int64, copy=False)
@@ -699,6 +1016,7 @@ def dump_update_trace(update_trace: list[dict[str, np.ndarray]]) -> OrderedDict[
     arrays["update_trace_post_ba_patch_depths"] = np.concatenate(
         [entry["post_ba_patch_depths"] for entry in update_trace], axis=0
     ).astype(np.float32, copy=False)
+    append_ba_debug_trace(arrays, update_trace)
     return arrays
 
 
@@ -745,12 +1063,15 @@ def write_metadata(
         "input_intrinsics": [float(value) for value in intrinsics.tolist()],
         "tracker_config": asdict(tracker_cfg),
         "dump_state": bool(args.dump_state),
+        "ba_debug_update_index": int(args.ba_debug_update_index),
+        "ba_debug_patches": parse_ba_debug_patches(args.ba_debug_patches),
     }
     (output_root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     args = parse_args()
+    ba_debug_patches = parse_ba_debug_patches(args.ba_debug_patches)
     np.random.seed(args.seed)
     configure_determinism(args.seed)
 
@@ -779,7 +1100,12 @@ def main() -> int:
         bootstrap_depths_by_frame,
         update_trace,
     ) = run_tracker(
-        args.weights, frames, intrinsics, tracker_cfg
+        args.weights,
+        frames,
+        intrinsics,
+        tracker_cfg,
+        args.ba_debug_update_index,
+        ba_debug_patches,
     )
     active_tstamps = slam.pg.tstamps_[: slam.n].astype(np.int64, copy=False)
     active_patch_frames = slam.ix[: slam.m].detach().cpu().numpy().astype(np.int64, copy=False)
