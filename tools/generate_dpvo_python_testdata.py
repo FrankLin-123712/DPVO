@@ -189,6 +189,14 @@ def parse_args() -> argparse.Namespace:
         help="Also save final DPVO patch-graph state tensors for deeper parity debugging.",
     )
     parser.add_argument(
+        "--dump-update-parity-cases",
+        action="store_true",
+        help=(
+            "Also save one update_block parity case per recorded tracker update "
+            "under <output-root>/update_parity/update_XXX."
+        ),
+    )
+    parser.add_argument(
         "--ba-debug-update-index",
         type=int,
         default=0,
@@ -408,6 +416,19 @@ def write_case(output_dir: Path, tensors: OrderedDict[str, np.ndarray]) -> None:
     write_manifest(output_dir, tensors)
     for name, array in tensors.items():
         np.ascontiguousarray(array).tofile(output_dir / f"{name}.bin")
+
+
+def write_update_parity_cases(output_root: Path, cases: list[OrderedDict[str, np.ndarray]]) -> Path:
+    case_root = output_root / "update_parity"
+    if case_root.exists():
+        shutil.rmtree(case_root)
+    case_root.mkdir(parents=True, exist_ok=True)
+
+    for index, tensors in enumerate(cases):
+        case_dir = case_root / f"update_{index:03d}"
+        case_dir.mkdir(parents=True, exist_ok=True)
+        write_case(case_dir, tensors)
+    return case_root
 
 
 def write_vector_manifest(
@@ -702,6 +723,7 @@ def run_tracker(
     list[np.ndarray],
     list[np.ndarray],
     list[dict[str, np.ndarray]],
+    list[OrderedDict[str, np.ndarray]],
 ]:
     try:
         import torch
@@ -719,14 +741,17 @@ def run_tracker(
     centers_by_frame: list[np.ndarray] = []
     bootstrap_depths_by_frame: list[np.ndarray | None] = [None] * len(frames)
     update_trace: list[dict[str, np.ndarray]] = []
+    update_parity_cases: list[OrderedDict[str, np.ndarray]] = []
     ba_debug_by_update_index: dict[int, dict[str, np.ndarray]] = {}
     ba_call_index = 0
 
     original_patchify_forward = slam.network.patchify.forward
     original_rand_like = torch.rand_like
     original_update = slam.update
+    original_network_update_forward = slam.network.update.forward
     original_fastba_ba = dpvo_module.fastba.BA
     current_frame_index: int | None = None
+    recording_tracker_update = False
 
     def recording_patchify_forward(images, patches_per_image=80, disps=None, centroid_sel_strat="RANDOM", return_color=False):
         outputs = original_patchify_forward(
@@ -813,8 +838,34 @@ def run_tracker(
             eff_impl=eff_impl,
         )
 
+    def recording_network_update_forward(net, inp, corr, flow, ii, jj, kk) -> Any:
+        result = original_network_update_forward(net, inp, corr, flow, ii, jj, kk)
+        if recording_tracker_update:
+            net_out, (delta, weight, _) = result
+            update_parity_cases.append(
+                OrderedDict(
+                    [
+                        ("net", net.detach().cpu().numpy().astype(np.float32, copy=True)),
+                        ("ctx", inp.detach().cpu().numpy().astype(np.float32, copy=True)),
+                        ("corr", corr.detach().cpu().numpy().astype(np.float32, copy=True)),
+                        ("ii", ii.detach().cpu().numpy().astype(np.int64, copy=True)),
+                        ("jj", jj.detach().cpu().numpy().astype(np.int64, copy=True)),
+                        ("kk", kk.detach().cpu().numpy().astype(np.int64, copy=True)),
+                        ("golden_net", net_out.detach().cpu().numpy().astype(np.float32, copy=True)),
+                        ("golden_delta", delta.detach().cpu().numpy().astype(np.float32, copy=True)),
+                        ("golden_weight", weight.detach().cpu().numpy().astype(np.float32, copy=True)),
+                    ]
+                )
+            )
+        return result
+
     def recording_update(*args: Any, **kwargs: Any) -> Any:
-        result = original_update(*args, **kwargs)
+        nonlocal recording_tracker_update
+        recording_tracker_update = True
+        try:
+            result = original_update(*args, **kwargs)
+        finally:
+            recording_tracker_update = False
         if hasattr(slam.pg, "target") and hasattr(slam.pg, "weight"):
             target = slam.pg.target.detach().cpu().numpy().astype(np.float32, copy=False)
             weight = slam.pg.weight.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -847,6 +898,7 @@ def run_tracker(
     slam.network.patchify.forward = recording_patchify_forward
     torch.rand_like = recording_rand_like
     slam.update = recording_update
+    slam.network.update.forward = recording_network_update_forward
     dpvo_module.fastba.BA = recording_fastba_ba
 
     try:
@@ -863,6 +915,7 @@ def run_tracker(
         slam.network.patchify.forward = original_patchify_forward
         torch.rand_like = original_rand_like
         slam.update = original_update
+        slam.network.update.forward = original_network_update_forward
         dpvo_module.fastba.BA = original_fastba_ba
 
     points = slam.pg.points_.detach().cpu().numpy()[: slam.m].astype(np.float32, copy=False)
@@ -883,6 +936,7 @@ def run_tracker(
         centers_by_frame,
         [depths for depths in bootstrap_depths_by_frame if depths is not None],
         update_trace,
+        update_parity_cases,
     )
 
 
@@ -1150,6 +1204,7 @@ def main() -> int:
         centers_by_frame,
         bootstrap_depths_by_frame,
         update_trace,
+        update_parity_cases,
     ) = run_tracker(
         args.weights,
         frames,
@@ -1205,6 +1260,8 @@ def main() -> int:
         tensors.update(dump_update_trace(update_trace))
 
     write_case(golden_dir, tensors)
+    if args.dump_update_parity_cases:
+        update_parity_root = write_update_parity_cases(args.output_root, update_parity_cases)
     write_tum_trajectory(golden_dir / "golden_trajectory_tum.txt", poses, tstamps)
 
     print(f"Generated compact DPVO input sequence under {args.output_root / 'images'}")
@@ -1225,6 +1282,8 @@ def main() -> int:
     )
     if args.dump_state:
         print(f"Included final DPVO patch-graph state tensors and {len(update_trace)} update trace snapshots")
+    if args.dump_update_parity_cases:
+        print(f"Wrote {len(update_parity_cases)} update parity cases under {update_parity_root}")
     return 0
 
 
