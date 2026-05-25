@@ -12,7 +12,7 @@ from dpvo.config import cfg
 from dpvo.dpvo import DPVO
 from dpvo.plot_utils import plot_trajectory, save_output_for_COLMAP, save_ply
 from dpvo.stream import image_stream, video_stream
-from dpvo.utils import Timer
+from dpvo.utils import Timer, print_timer_summary, reset_timer_stats
 
 SKIP = 0
 
@@ -26,6 +26,8 @@ def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False
 
     slam = None
     queue = Queue(maxsize=8)
+    if timeit:
+        reset_timer_stats()
 
     if os.path.isdir(imagedir):
         reader = Process(target=image_stream, args=(queue, imagedir, calib, stride, skip))
@@ -38,12 +40,14 @@ def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False
         (t, image, intrinsics) = queue.get()
         if t < 0: break
 
-        image = torch.from_numpy(image).permute(2,0,1).cuda()
-        intrinsics = torch.from_numpy(intrinsics).cuda()
+        with Timer("input/to_cuda", enabled=timeit):
+            image = torch.from_numpy(image).permute(2,0,1).cuda()
+            intrinsics = torch.from_numpy(intrinsics).cuda()
 
         if slam is None:
             _, H, W = image.shape
             slam = DPVO(cfg, network, ht=H, wd=W, viz=viz)
+            slam.enable_timing = timeit
 
         with Timer("SLAM", enabled=timeit):
             slam(t, image, intrinsics)
@@ -53,7 +57,12 @@ def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False
     points = slam.pg.points_.cpu().numpy()[:slam.m]
     colors = slam.pg.colors_.view(-1, 3).cpu().numpy()[:slam.m]
 
-    return slam.terminate(), (points, colors, (*intrinsics, H, W))
+    slam.enable_timing = False
+    result = slam.terminate()
+    if timeit:
+        print_timer_summary()
+
+    return result, (points, colors, (*intrinsics, H, W))
 
 
 if __name__ == '__main__':
@@ -100,4 +109,3 @@ if __name__ == '__main__':
 
 
         
-

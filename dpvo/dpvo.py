@@ -244,13 +244,15 @@ class DPVO:
         ii = self.ix[kk]
 
         net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
-        coords = self.reproject(indicies=(ii, jj, kk))
+        with Timer("motion_probe/reproject", enabled=self.enable_timing):
+            coords = self.reproject(indicies=(ii, jj, kk))
 
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            corr = self.corr(coords, indicies=(kk, jj))
-            ctx = self.imap[:,kk % (self.M * self.pmem)]
-            net, (delta, weight, _) = \
-                self.network.update(net, ctx, corr, None, ii, jj, kk)
+        with Timer("motion_probe/network", enabled=self.enable_timing):
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                corr = self.corr(coords, indicies=(kk, jj))
+                ctx = self.imap[:,kk % (self.M * self.pmem)]
+                net, (delta, weight, _) = \
+                    self.network.update(net, ctx, corr, None, ii, jj, kk)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
@@ -326,15 +328,17 @@ class DPVO:
         self.ran_global_ba[self.n] = True
 
     def update(self):
-        with Timer("other", enabled=self.enable_timing):
+        with Timer("update/reproject", enabled=self.enable_timing):
             coords = self.reproject()
 
+        with Timer("update/corr_update_net", enabled=self.enable_timing):
             with autocast(enabled=self.cfg.MIXED_PRECISION):
                 corr = self.corr(coords)
                 ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
                 self.pg.net, (delta, weight, _) = \
                     self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
 
+        with Timer("update/target_weight", enabled=self.enable_timing):
             lmbda = torch.as_tensor([1e-4], device="cuda")
             weight = weight.float()
             target = coords[...,self.P//2,self.P//2] + delta.float()
@@ -342,19 +346,21 @@ class DPVO:
         self.pg.target = target
         self.pg.weight = weight
 
-        with Timer("BA", enabled=self.enable_timing):
-            try:
-                # run global bundle adjustment if there exist long-range edges
-                if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
+        try:
+            # run global bundle adjustment if there exist long-range edges
+            if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
+                with Timer("ba/global", enabled=self.enable_timing):
                     self.__run_global_BA()
-                else:
+            else:
+                with Timer("ba/local", enabled=self.enable_timing):
                     t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
                     t0 = max(t0, 1)
                     fastba.BA(self.poses, self.patches, self.intrinsics, 
                         target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
-            except:
-                print("Warning BA failed...")
+        except:
+            print("Warning BA failed...")
 
+        with Timer("update/point_cloud", enabled=self.enable_timing):
             points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
             points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
             self.pg.points_[:len(points)] = points[:]
@@ -378,85 +384,94 @@ class DPVO:
         """ track new frame """
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
-            self.long_term_lc(image, self.n)
+            with Timer("frame/classic_lc_insert", enabled=self.enable_timing):
+                self.long_term_lc(image, self.n)
 
         if (self.n+1) >= self.N:
             raise Exception(f'The buffer size is too small. You can increase it using "--opts BUFFER_SIZE={self.N*2}"')
 
         if self.viewer is not None:
-            self.viewer.update_image(image.contiguous())
+            with Timer("frame/viewer_image", enabled=self.enable_timing):
+                self.viewer.update_image(image.contiguous())
 
-        image = 2 * (image[None,None] / 255.0) - 0.5
+        with Timer("frame/preprocess", enabled=self.enable_timing):
+            image = 2 * (image[None,None] / 255.0) - 0.5
         
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            fmap, gmap, imap, patches, _, clr = \
-                self.network.patchify(image,
-                    patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                    centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT, 
-                    return_color=True)
+        with Timer("frame/patchify", enabled=self.enable_timing):
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                fmap, gmap, imap, patches, _, clr = \
+                    self.network.patchify(image,
+                        patches_per_image=self.cfg.PATCHES_PER_FRAME,
+                        centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT,
+                        return_color=True)
 
         ### update state attributes ###
-        self.tlist.append(tstamp)
-        self.pg.tstamps_[self.n] = self.counter
-        self.pg.intrinsics_[self.n] = intrinsics / self.RES
+        with Timer("frame/state_update", enabled=self.enable_timing):
+            self.tlist.append(tstamp)
+            self.pg.tstamps_[self.n] = self.counter
+            self.pg.intrinsics_[self.n] = intrinsics / self.RES
 
-        # color info for visualization
-        clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
-        self.pg.colors_[self.n] = clr.to(torch.uint8)
+            # color info for visualization
+            clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
+            self.pg.colors_[self.n] = clr.to(torch.uint8)
 
-        self.pg.index_[self.n + 1] = self.n + 1
-        self.pg.index_map_[self.n + 1] = self.m + self.M
+            self.pg.index_[self.n + 1] = self.n + 1
+            self.pg.index_map_[self.n + 1] = self.m + self.M
 
-        if self.n > 1:
-            if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
-                P1 = SE3(self.pg.poses_[self.n-1])
-                P2 = SE3(self.pg.poses_[self.n-2])
+            if self.n > 1:
+                if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
+                    P1 = SE3(self.pg.poses_[self.n-1])
+                    P2 = SE3(self.pg.poses_[self.n-2])
 
-                # To deal with varying camera hz
-                *_, a,b,c = [1]*3 + self.tlist
-                fac = (c-b) / (b-a)
+                    # To deal with varying camera hz
+                    *_, a,b,c = [1]*3 + self.tlist
+                    fac = (c-b) / (b-a)
 
-                xi = self.cfg.MOTION_DAMPING * fac * (P1 * P2.inv()).log()
-                tvec_qvec = (SE3.exp(xi) * P1).data
-                self.pg.poses_[self.n] = tvec_qvec
-            else:
-                tvec_qvec = self.poses[self.n-1]
-                self.pg.poses_[self.n] = tvec_qvec
+                    xi = self.cfg.MOTION_DAMPING * fac * (P1 * P2.inv()).log()
+                    tvec_qvec = (SE3.exp(xi) * P1).data
+                    self.pg.poses_[self.n] = tvec_qvec
+                else:
+                    tvec_qvec = self.poses[self.n-1]
+                    self.pg.poses_[self.n] = tvec_qvec
 
-        # TODO better depth initialization
-        patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
-        if self.is_initialized:
-            s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
-            patches[:,:,2] = s
+            # TODO better depth initialization
+            patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
+            if self.is_initialized:
+                s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
+                patches[:,:,2] = s
 
-        self.pg.patches_[self.n] = patches
+            self.pg.patches_[self.n] = patches
 
-        ### update network attributes ###
-        self.imap_[self.n % self.pmem] = imap.squeeze()
-        self.gmap_[self.n % self.pmem] = gmap.squeeze()
-        self.fmap1_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 1, 1)
-        self.fmap2_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 4, 4)
+            ### update network attributes ###
+            self.imap_[self.n % self.pmem] = imap.squeeze()
+            self.gmap_[self.n % self.pmem] = gmap.squeeze()
+            self.fmap1_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 1, 1)
+            self.fmap2_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 4, 4)
 
-        self.counter += 1        
+            self.counter += 1
+
         if self.n > 0 and not self.is_initialized:
-            if self.motion_probe() < 2.0:
+            with Timer("frame/motion_probe", enabled=self.enable_timing):
+                has_motion = self.motion_probe() >= 2.0
+            if not has_motion:
                 self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
                 return
 
         self.n += 1
         self.m += self.M
 
-        if self.cfg.LOOP_CLOSURE:
-            if self.n - self.last_global_ba >= self.cfg.GLOBAL_OPT_FREQ:
-                """ Add loop closure factors """
-                lii, ljj = self.pg.edges_loop()
-                if lii.numel() > 0:
-                    self.last_global_ba = self.n
-                    self.append_factors(lii, ljj)
+        with Timer("frame/factor_graph", enabled=self.enable_timing):
+            if self.cfg.LOOP_CLOSURE:
+                if self.n - self.last_global_ba >= self.cfg.GLOBAL_OPT_FREQ:
+                    """ Add loop closure factors """
+                    lii, ljj = self.pg.edges_loop()
+                    if lii.numel() > 0:
+                        self.last_global_ba = self.n
+                        self.append_factors(lii, ljj)
 
-        # Add forward and backward factors
-        self.append_factors(*self.__edges_forw())
-        self.append_factors(*self.__edges_back())
+            # Add forward and backward factors
+            self.append_factors(*self.__edges_forw())
+            self.append_factors(*self.__edges_back())
 
         if self.n == 8 and not self.is_initialized:
             self.is_initialized = True
@@ -466,8 +481,10 @@ class DPVO:
 
         elif self.is_initialized:
             self.update()
-            self.keyframe()
+            with Timer("frame/keyframe", enabled=self.enable_timing):
+                self.keyframe()
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
-            self.long_term_lc.attempt_loop_closure(self.n)
-            self.long_term_lc.lc_callback()
+            with Timer("frame/classic_lc_update", enabled=self.enable_timing):
+                self.long_term_lc.attempt_loop_closure(self.n)
+                self.long_term_lc.lc_callback()

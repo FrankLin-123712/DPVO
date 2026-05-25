@@ -1,9 +1,11 @@
+from collections import defaultdict
 from contextlib import ContextDecorator
 import torch
 import torch.nn.functional as F
 
 
 all_times = []
+timer_stats = defaultdict(list)
 
 class Timer(ContextDecorator):
     def __init__(self, name, enabled=True):
@@ -17,6 +19,7 @@ class Timer(ContextDecorator):
     def __enter__(self):
         if self.enabled:
             self.start.record()
+        return self
         
     def __exit__(self, type, value, traceback):
         global all_times
@@ -26,7 +29,27 @@ class Timer(ContextDecorator):
 
             elapsed = self.start.elapsed_time(self.end)
             all_times.append(elapsed)
+            timer_stats[self.name].append(elapsed)
             print(f"{self.name} {elapsed:.03f}")
+
+
+def reset_timer_stats():
+    all_times.clear()
+    timer_stats.clear()
+
+
+def print_timer_summary():
+    if not timer_stats:
+        return
+
+    print("\nTiming summary (ms)")
+    print(f"{'stage':<28} {'count':>7} {'mean':>10} {'total':>10} {'min':>10} {'max':>10}")
+    print("-" * 79)
+    for name in sorted(timer_stats):
+        values = timer_stats[name]
+        total = sum(values)
+        mean = total / len(values)
+        print(f"{name:<28} {len(values):>7d} {mean:>10.3f} {total:>10.3f} {min(values):>10.3f} {max(values):>10.3f}")
 
 
 def coords_grid(b, n, h, w, **kwargs):
@@ -85,4 +108,3 @@ def set_depth(patches, depth):
 def flatmeshgrid(*args, **kwargs):
     grid = torch.meshgrid(*args, **kwargs)
     return (x.reshape(-1) for x in grid)
-
