@@ -172,17 +172,45 @@ python evaluate_icl_nuim.py --trials=5 --plot --save_trajectory
 python evaluate_kitti.py --trials=5 --plot --save_trajectory
 ```
 
-## ONNX Export
-The repo ships one supported ONNX export path under `tools/`. The update block export uses explicit neighbor indices `ix` and `jx`, which is the fixed replacement for the older `fastba.neighbors(...)` ONNX export.
+## Tools
 
-Export both ONNX models with the helper script:
+The scripts under `tools/` cover ONNX export, workload estimation, runtime parity data generation, and video frame extraction. Run the commands below from the repository root after activating the `dpvo` environment. Use `python tools/<script>.py --help` for the complete option list.
+
+| Script | Purpose |
+| --- | --- |
+| `export2onnx.sh` | Export the feature encoder and update block with the standard defaults. |
+| `export_models.py` | Configurable ONNX exporter used by `export2onnx.sh`. |
+| `verify_onnxmodel.py` | Print ONNX metadata and run the ONNX structural checker. |
+| `analyze_dpvo_workload.py` | Statically estimate module-level MACs, memory traffic, and operational intensity. |
+| `gen_testdata.sh` | Generate the predefined end-to-end and component parity datasets. |
+| `generate_dpvo_python_testdata.py` | Generate a resized input sequence and golden outputs from the Python DPVO tracker. |
+| `generate_dpvo_runner_parity_testdata.py` | Generate patchify, correlation, update, and bundle-adjustment parity cases. |
+| `generate_update_block_case.py` | Generate a small deterministic update-block parity case. |
+| `turn_mov2png.sh` | Convert every `.mov`/`.MOV` file in a directory to PNG frames. |
+| `dpvo_runner_parity_common.py` | Internal support module for the runner parity generator; it is not a standalone command. |
+
+### ONNX export and validation
+
+The ONNX commands require the Python `onnx` package in addition to the installed DPVO environment.
+
+Export both supported models:
+
 ```bash
 ./tools/export2onnx.sh
 ```
 
-The helper accepts overrides via environment variables such as `WEIGHTS`, `OUT_DIR`, `HEIGHT`, `WIDTH`, `EDGES`, and `OPSET`.
+`export2onnx.sh` uses `$HOME/miniconda3/envs/dpvo/bin/python` when available and otherwise uses `python` from `PATH`. Its defaults can be overridden with environment variables:
 
-Or call the exporter directly:
+```bash
+PYTHON_BIN=/path/to/python \
+WEIGHTS=./dpvo.pth \
+OUT_DIR=./exported_models \
+HEIGHT=480 WIDTH=640 EDGES=256 OPSET=13 \
+./tools/export2onnx.sh
+```
+
+For finer control, invoke the exporter directly:
+
 ```bash
 python tools/export_models.py \
     --weights ./dpvo.pth \
@@ -193,33 +221,143 @@ python tools/export_models.py \
     --opset 13
 ```
 
-This writes:
+Add `--skip-feature` or `--skip-update` to export only one model. The command writes:
+
 - `exported_models/feature_extractor.onnx`
 - `exported_models/update_block.onnx`
 
-The exported update block takes these inputs:
-- `net`
-- `ctx`
-- `corr`
-- `ii`
-- `jj`
-- `kk`
-- `ix`
-- `jx`
+The feature extractor accepts `images` and returns `fmap` and `imap`. It contains only the image encoders; Python `patchify` logic and custom DPVO runtime operations are not included.
 
-And returns:
-- `net_out`
-- `delta`
-- `weight`
+The update block accepts `net`, `ctx`, `corr`, `ii`, `jj`, `kk`, `ix`, and `jx`, and returns `net_out`, `delta`, and `weight`. The runtime must compute the correlation/context tensors and graph indices, including the explicit previous/next neighbor links `ix` and `jx`, before inference. This explicit-neighbor interface is the supported replacement for exporting `fastba.neighbors(...)`.
 
-Useful helpers:
-- `python tools/verify_onnxmodel.py exported_models/update_block.onnx`
-- `python tools/generate_update_block_case.py --output /tmp/dpvo_update_block_case_small`
-- `./tools/turn_mov2png.sh`
+Inspect either model and run `onnx.checker`:
 
-Notes:
-- `feature_extractor.onnx` exports only the image encoders. The Python `patchify` logic and custom DPVO runtime ops are not folded into this model.
-- `update_block.onnx` expects host-side code to precompute `corr`, `ctx`, and the graph index tensors, including the explicit neighbor links `ix` and `jx`.
+```bash
+python tools/verify_onnxmodel.py exported_models/update_block.onnx
+```
+
+The default model, when the positional path is omitted, is `exported_models/update_block.onnx`.
+
+### Workload and roofline estimation
+
+`analyze_dpvo_workload.py` is a dependency-free static estimator, not a runtime profiler. It models the feature encoder, update block, correlation lookup, BA Jacobian construction, and Schur complement using `config/default.yaml` unless another config is supplied.
+
+Print the default Markdown table:
+
+```bash
+python tools/analyze_dpvo_workload.py
+```
+
+Estimate a particular graph and classify each module using a hardware roofline:
+
+```bash
+python tools/analyze_dpvo_workload.py \
+    --height 480 --width 640 \
+    --edges 8192 --unique-patches 960 \
+    --peak-macs 1T --bandwidth 100GB/s
+```
+
+Results can be written as Markdown, CSV, or JSON:
+
+```bash
+python tools/analyze_dpvo_workload.py \
+    --edge-mode new-frame \
+    --format csv \
+    --output workload.csv
+```
+
+Without `--edges`, the edge count is estimated from `PATCHES_PER_FRAME`, `PATCH_LIFETIME`, and `REMOVAL_WINDOW`. Use `--edge-mode steady` for the active steady-state graph or `--edge-mode new-frame` for newly appended edges. Roofline arguments must be supplied in pairs: either `--peak-macs` with `--bandwidth`, or `--peak-macs-per-cycle` with `--bandwidth-per-cycle`.
+
+### Test and parity data generation
+
+These generators expect an installed DPVO package and `dpvo.pth`. The end-to-end and runner parity generators also execute DPVO CUDA/custom operations; use a CUDA-enabled DPVO environment. Generated tensors are raw contiguous `.bin` files described by a `manifest.txt` file.
+
+Input frames are discovered in filename order and may be PNG or JPEG. Calibration files must contain at least `fx fy cx cy`; additional values are treated as distortion coefficients by the end-to-end generator.
+
+Generate all predefined datasets:
+
+```bash
+./tools/gen_testdata.sh 0
+```
+
+The mode selects which dataset to generate:
+
+| Mode | Output under `testdata/` | Description |
+| --- | --- | --- |
+| `0` | All outputs below | Generate every predefined dataset. This is also the default when no mode is given. |
+| `1` | `dpvo_runner_parity_small/` | Four small component parity cases. |
+| `2` | `dpvo_python_medium_fast/` | 32-frame end-to-end case, 256-pixel maximum long edge, 16 patches per frame. |
+| `3` | `dpvo_python_medium/` | 32-frame end-to-end case, 512-pixel maximum long edge, 64 patches per frame. |
+
+The wrapper defaults to `dpvo.pth`, `subset_0493/`, `calib/iphone.txt`, and `testdata/`. Override them when using another sequence:
+
+```bash
+PYTHON_BIN=/path/to/python \
+WEIGHTS=/path/to/dpvo.pth \
+IMAGES=/path/to/frames \
+CALIB=/path/to/calib.txt \
+TESTDATA_ROOT=/path/to/testdata \
+./tools/gen_testdata.sh 1
+```
+
+To customize an end-to-end case directly:
+
+```bash
+python tools/generate_dpvo_python_testdata.py \
+    --weights ./dpvo.pth \
+    --images ./subset_0493 \
+    --calib ./calib/iphone.txt \
+    --output-root ./testdata/dpvo_python_small \
+    --frame-start 1 --frame-count 12 --frame-step 1 \
+    --max-long-edge 256 \
+    --patches-per-frame 32 \
+    --seed 7 --dump-state
+```
+
+At least eight frames are required. `--width` and `--height` may be supplied together instead of `--max-long-edge`; output dimensions are aligned down to multiples of 16 and cannot exceed the source dimensions. The output contains preprocessed frames, adjusted calibration, patch-center and bootstrap-depth data, metadata, golden tensors, and a TUM-format golden trajectory. `--dump-state` adds the final patch-graph state and update trace. `--dump-update-parity-cases` additionally writes one update-block case per tracker update. Existing `images/`, `golden/`, `centers/`, and `bootstrap_depths/` directories under the selected output root are replaced.
+
+Generate the four component-level cases directly:
+
+```bash
+python tools/generate_dpvo_runner_parity_testdata.py \
+    --weights ./dpvo.pth \
+    --images ./subset_0493 \
+    --calib ./calib/iphone.txt \
+    --output-root ./testdata/dpvo_runner_parity_small \
+    --width 256 --height 144 \
+    --frame-start 1 --frame-count 4 \
+    --patches-per-frame 8
+```
+
+This creates `patchify_small/`, `correlation_small/`, `update_small/`, and `bundle_adjustment_small/`. Supply all path arguments when invoking this script directly; its built-in path defaults are machine-specific. Bundle-adjustment golden generation requires CUDA.
+
+For a small CPU-only update-block test vector that does not require source images:
+
+```bash
+python tools/generate_update_block_case.py \
+    --weights ./dpvo.pth \
+    --output /tmp/dpvo_update_block_case_small \
+    --seed 7 --groups 4 --edges-per-group 3
+```
+
+The output contains inputs, explicit `ix`/`jx` neighbor indices, golden `net`/`delta`/`weight` tensors, and `manifest.txt`. `--groups` must be positive and `--edges-per-group` must be at least 2.
+
+### Convert MOV videos to PNG sequences
+
+`turn_mov2png.sh` requires `ffmpeg`. By default it converts every `.mov`/`.MOV` under `movies/` at 30 FPS and writes each video to `sequences/<video-name>/`:
+
+```bash
+./tools/turn_mov2png.sh
+```
+
+Override the input, output, or frame rate with environment variables:
+
+```bash
+INPUT_DIR=/path/to/movies \
+OUTPUT_DIR=/path/to/sequences \
+FPS=15 \
+./tools/turn_mov2png.sh
+```
 
 ## Training
 Make sure you have run `./download_models_and_data.sh`. Your directory structure should look as follows
