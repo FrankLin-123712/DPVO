@@ -22,5 +22,6 @@ dependencies:
     - numpy==1.26.4
     - plyfile
     - evo
+    - gdown
     - opencv-python
     - yacs
