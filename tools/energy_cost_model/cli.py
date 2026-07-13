@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     app.add_argument("--edge-mode", choices=("steady", "new-frame"), default="steady", help="Active steady-state graph or only newly appended edges.")
     app.add_argument("--edges", type=int, help="Override active factor/edge count E.")
     app.add_argument("--unique-patches", type=int, help="Override unique patch count K for BA/Schur.")
+    app.add_argument("--unique-frame-pairs", type=int, help="Override unique (ii,jj) groups for SoftAgg.")
     app.add_argument("--nn-dtype-bytes", type=int, choices=(1, 2, 4, 8), help="Bytes per NN activation/weight element.")
     app.add_argument("--ba-dtype-bytes", type=int, choices=(4, 8), default=4, help="Bytes per BA scalar.")
     app.add_argument("--ba-macs-per-edge", type=int, default=900, help="MAC-equivalent BA assembly work per edge per BA iteration.")
@@ -82,9 +83,9 @@ def parse_args() -> argparse.Namespace:
     hw = parser.add_argument_group("Hardware parameters H/P_h")
     hw.add_argument(
         "--hardware-profile",
-        choices=("generated-header", "default-int8", "fp32-default", "custom"),
-        default="generated-header",
-        help="Gemmini defaults. generated-header parses software/libgemmini/gemmini_params.h.",
+        choices=("generated-header", "default-int8", "fp16-default", "fp32-default", "custom"),
+        default="fp16-default",
+        help="Explicit Gemmini profile. generated-header fails if gemmini_params.h is absent.",
     )
     hw.add_argument("--gemmini-header", type=Path, default=DEFAULT_GEMMINI_HEADER, help="Path to generated gemmini_params.h.")
     hw.add_argument("--gemmini-dim", type=int, help="Override square Gemmini DIM.")
@@ -104,15 +105,18 @@ def parse_args() -> argparse.Namespace:
     hw.add_argument("--random-l2-hit-rate", type=float, help="CPU random read L2 hit rate after L1 miss.")
     hw.add_argument("--sequential-l1-hit-rate", type=float, help="CPU sequential read L1 hit rate.")
     hw.add_argument("--sequential-l2-hit-rate", type=float, help="CPU sequential read L2 hit rate after L1 miss.")
+    hw.add_argument("--cache-line-bytes", type=int, help="CPU cache-line size used for random-access amplification.")
 
     mp = parser.add_argument_group("Mapping choices M_k")
     mp.add_argument("--encoder-mapping", choices=("gemmini", "cpu"), default="gemmini")
     mp.add_argument("--update-mapping", choices=("gemmini", "cpu"), default="gemmini")
-    mp.add_argument("--corr-mapping", choices=("cpu", "gemmini"), default="cpu")
+    mp.add_argument("--factor-head-mapping", choices=("gemmini", "cpu"), default="gemmini")
+    mp.add_argument("--corr-mapping", choices=("cpu",), default="cpu", help="Block-batched Gemmini correlation is not modeled yet.")
     mp.add_argument("--patch-mapping", choices=("cpu",), default="cpu")
     mp.add_argument("--softagg-mapping", choices=("cpu",), default="cpu")
     mp.add_argument("--ba-mapping", choices=("cpu",), default="cpu")
     mp.add_argument("--graph-mapping", choices=("cpu",), default="cpu")
+    mp.add_argument("--dataflow", choices=("WS", "OS"), default="WS", help="Gemmini dense-op dataflow.")
     mp.add_argument("--no-overlap-dma-compute", action="store_true", help="Use sum instead of max for Gemmini compute/DMA/memory timing.")
 
     out = parser.add_argument_group("Output")
@@ -120,6 +124,7 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--format", choices=("markdown", "json", "csv"), default="markdown")
     out.add_argument("--output", type=Path, help="Write report to path instead of stdout.")
     out.add_argument("--show-actions", action="store_true", help="Include aggregate action counts in markdown/json.")
+    out.add_argument("--target-fps", type=parse_si_number, help="Optional fixed input rate for E/frame * fps power and feasibility.")
 
     return parser.parse_args()
 
@@ -141,6 +146,7 @@ def build_algorithm(args: argparse.Namespace) -> AlgorithmParams:
         edge_mode=args.edge_mode,
         edges=args.edges,
         unique_patches=args.unique_patches,
+        unique_frame_pairs=args.unique_frame_pairs,
         nn_dtype_bytes=args.nn_dtype_bytes,
         ba_dtype_bytes=args.ba_dtype_bytes,
         ba_macs_per_edge=args.ba_macs_per_edge,
@@ -165,7 +171,34 @@ def build_hardware(args: argparse.Namespace) -> HardwareParams:
         "random_l2_hit_rate": args.random_l2_hit_rate,
         "sequential_l1_hit_rate": args.sequential_l1_hit_rate,
         "sequential_l2_hit_rate": args.sequential_l2_hit_rate,
+        "cache_line_bytes": args.cache_line_bytes,
     }
+    if args.input_bytes is not None:
+        # The CLI's algorithm precision convention is int8 for 1 byte and
+        # floating point for wider tensors. Keep the unit-energy lookup in
+        # sync with the storage-width override instead of retaining a stale
+        # profile label such as fp16 with one-byte operands.
+        overrides["input_precision"] = {
+            1: "int8",
+            2: "fp16",
+            4: "fp32",
+            8: "fp64",
+        }[args.input_bytes]
+        if args.acc_bytes is None:
+            floating_acc = str(overrides["input_precision"]).startswith(("fp", "bf"))
+            overrides["acc_precision"] = (
+                {2: "fp16", 4: "fp32", 8: "fp64"}
+                if floating_acc
+                else {2: "int16", 4: "int32", 8: "int64"}
+            )[hardware.acc_bytes]
+    if args.acc_bytes is not None:
+        input_precision = overrides.get("input_precision", hardware.input_precision)
+        floating_acc = str(input_precision).startswith(("fp", "bf"))
+        overrides["acc_precision"] = (
+            {2: "fp16", 4: "fp32", 8: "fp64"}
+            if floating_acc
+            else {2: "int16", 4: "int32", 8: "int64"}
+        )[args.acc_bytes]
     clean = {key: value for key, value in overrides.items() if value is not None}
     hardware = replace(hardware, **clean)
     bw_overrides = {}
@@ -184,37 +217,49 @@ def build_mapping(args: argparse.Namespace) -> MappingParams:
     return MappingParams(
         encoder=args.encoder_mapping,
         update_dense=args.update_mapping,
+        factor_head=args.factor_head_mapping,
         correlation=args.corr_mapping,
         patch_extraction=args.patch_mapping,
         soft_aggregation=args.softagg_mapping,
         ba=args.ba_mapping,
         graph_management=args.graph_mapping,
+        dataflow=args.dataflow,
         overlap_dma_compute=not args.no_overlap_dma_compute,
     )
 
 
 def main() -> int:
     args = parse_args()
-    algorithm = build_algorithm(args)
-    hardware = build_hardware(args)
-    mapping = build_mapping(args)
-    energy_table = EnergyTable.defaults(hardware)
-    if args.energy_table is not None:
-        energy_table = EnergyTable.from_json(args.energy_table, energy_table)
+    try:
+        algorithm = build_algorithm(args)
+        hardware = build_hardware(args)
+        mapping = build_mapping(args)
+        energy_table = EnergyTable.defaults(hardware)
+        if args.energy_table is not None:
+            energy_table = EnergyTable.from_json(args.energy_table, energy_table)
 
-    report = estimate_energy(algorithm, hardware, mapping, energy_table)
-    if args.format == "json":
-        text = report.to_json(include_actions=args.show_actions)
-    elif args.format == "csv":
-        text = report.to_csv()
-    else:
-        text = report.to_markdown(include_actions=args.show_actions)
+        report = estimate_energy(
+            algorithm,
+            hardware,
+            mapping,
+            energy_table,
+            target_fps=args.target_fps,
+        )
+        if args.format == "json":
+            text = report.to_json(include_actions=args.show_actions)
+        elif args.format == "csv":
+            text = report.to_csv()
+        else:
+            text = report.to_markdown(include_actions=args.show_actions)
 
-    if args.output:
-        args.output.write_text(text)
-    else:
-        sys.stdout.write(text)
-    return 0
+        if args.output:
+            args.output.write_text(text, encoding="utf-8")
+        else:
+            sys.stdout.write(text)
+        return 0
+    except (FileNotFoundError, KeyError, NotImplementedError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
 
 
 if __name__ == "__main__":

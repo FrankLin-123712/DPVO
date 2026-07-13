@@ -7,6 +7,7 @@ first-order analytical model, not calibrated silicon numbers.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -14,15 +15,14 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+IMPLEMENTATION_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DPVO_CONFIG = REPO_ROOT / "config" / "default.yaml"
 DEFAULT_GEMMINI_HEADER = (
-    WORKSPACE_ROOT
-    / "chipyard"
-    / "generators"
+    IMPLEMENTATION_ROOT
     / "gemmini"
     / "software"
-    / "libgemmini"
+    / "gemmini-rocc-tests"
+    / "include"
     / "gemmini_params.h"
 )
 
@@ -104,12 +104,54 @@ class AlgorithmParams:
     edge_mode: str = "steady"
     edges: int | None = None
     unique_patches: int | None = None
+    unique_frame_pairs: int | None = None
     nn_dtype_bytes: int = 2
     ba_dtype_bytes: int = 4
     ba_macs_per_edge: int = 900
     centroid_selection: str = "RANDOM"
     loop_closure: bool = False
     classic_loop_closure: bool = False
+
+    def __post_init__(self) -> None:
+        positive = {
+            "height": self.height,
+            "width": self.width,
+            "patches_per_frame": self.patches_per_frame,
+            "removal_window": self.removal_window,
+            "optimization_window": self.optimization_window,
+            "patch_lifetime": self.patch_lifetime,
+            "patch_size": self.patch_size,
+            "corr_levels": self.corr_levels,
+            "update_iterations": self.update_iterations,
+            "ba_iterations": self.ba_iterations,
+            "ba_macs_per_edge": self.ba_macs_per_edge,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.corr_radius < 0:
+            raise ValueError(f"corr_radius must be non-negative, got {self.corr_radius}")
+        if self.edge_mode not in {"steady", "new-frame"}:
+            raise ValueError(f"unknown edge_mode: {self.edge_mode}")
+        for name, value in {
+            "edges": self.edges,
+            "unique_patches": self.unique_patches,
+            "unique_frame_pairs": self.unique_frame_pairs,
+        }.items():
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive when provided, got {value}")
+        for name, value in {
+            "unique_patches": self.unique_patches,
+            "unique_frame_pairs": self.unique_frame_pairs,
+        }.items():
+            if value is not None and value > self.active_edges:
+                raise ValueError(
+                    f"{name} cannot exceed active edge count {self.active_edges}, got {value}"
+                )
+        if self.nn_dtype_bytes not in {1, 2, 4, 8}:
+            raise ValueError(f"unsupported nn_dtype_bytes: {self.nn_dtype_bytes}")
+        if self.ba_dtype_bytes not in {4, 8}:
+            raise ValueError(f"unsupported ba_dtype_bytes: {self.ba_dtype_bytes}")
 
     @classmethod
     def from_config(
@@ -140,7 +182,23 @@ class AlgorithmParams:
         if self.edge_mode == "new-frame":
             return new_edges
         if self.edge_mode == "steady":
-            return self.patches_per_frame * self.removal_window * (2 * self.patch_lifetime - 1)
+            # DPVO removes expired factors after the current frame update, so
+            # the normal update sees ages 0..REMOVAL_WINDOW. Recent patches
+            # have not accumulated all future edges, hence r+min(r-1, age).
+            retained_edges_per_patch = sum(
+                self.patch_lifetime + min(self.patch_lifetime - 1, age)
+                for age in range(self.removal_window + 1)
+            )
+            # If r exceeds the removal horizon, __edges_forw() temporarily
+            # reintroduces older source patches for their single edge to the
+            # current target. Their earlier factors remain removed.
+            reintroduced_edges_per_patch = max(
+                0,
+                self.patch_lifetime - self.removal_window - 1,
+            )
+            return self.patches_per_frame * (
+                retained_edges_per_patch + reintroduced_edges_per_patch
+            )
         raise ValueError(f"unknown edge_mode: {self.edge_mode}")
 
     @property
@@ -148,18 +206,34 @@ class AlgorithmParams:
         return self.patches_per_frame * (2 * self.patch_lifetime - 1)
 
     @property
+    def active_source_frames(self) -> int:
+        if self.edge_mode == "new-frame":
+            # Newly appended forward factors can reintroduce patches older
+            # than REMOVAL_WINDOW, up to PATCH_LIFETIME.
+            return self.patch_lifetime
+        return max(self.removal_window + 1, self.patch_lifetime)
+
+    @property
     def active_unique_patches(self) -> int:
         if self.unique_patches is not None:
             return self.unique_patches
-        return min(self.active_edges, self.patches_per_frame * self.removal_window)
+        return min(self.active_edges, self.patches_per_frame * self.active_source_frames)
+
+    @property
+    def active_unique_frame_pairs(self) -> int:
+        if self.unique_frame_pairs is not None:
+            return self.unique_frame_pairs
+        # Forward/backward factors are created in blocks of roughly one
+        # PATCHES_PER_FRAME-sized source/target frame pair.
+        return max(1, ceil_div(self.active_edges, self.patches_per_frame))
 
     @property
     def feature_height(self) -> int:
-        return self.height // 4
+        return ceil_div(self.height, 4)
 
     @property
     def feature_width(self) -> int:
-        return self.width // 4
+        return ceil_div(self.width, 4)
 
 
 @dataclass(frozen=True)
@@ -174,9 +248,42 @@ class MappingParams:
     soft_aggregation: str = "cpu"
     ba: str = "cpu"
     graph_management: str = "cpu"
-    dataflow: str = "BOTH"
+    geometry: str = "cpu"
+    dataflow: str = "WS"
     overlap_dma_compute: bool = True
     gemmini_min_utilization_for_offload: float = 0.10
+
+    def __post_init__(self) -> None:
+        for name in (
+            "encoder",
+            "update_dense",
+            "correlation",
+            "factor_head",
+            "patch_extraction",
+            "soft_aggregation",
+            "ba",
+            "graph_management",
+            "geometry",
+        ):
+            value = getattr(self, name)
+            if value not in {"cpu", "gemmini"}:
+                raise ValueError(f"unsupported mapping {name}={value}")
+        for name in (
+            "correlation",
+            "patch_extraction",
+            "soft_aggregation",
+            "ba",
+            "graph_management",
+            "geometry",
+        ):
+            if getattr(self, name) != "cpu":
+                raise ValueError(
+                    f"{name}=gemmini is not implemented by the current action model"
+                )
+        if self.dataflow not in {"WS", "OS"}:
+            raise ValueError(f"dataflow must be WS or OS, got {self.dataflow}")
+        if not 0.0 <= self.gemmini_min_utilization_for_offload <= 1.0:
+            raise ValueError("gemmini_min_utilization_for_offload must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -209,6 +316,63 @@ class HardwareParams:
     sequential_l2_hit_rate: float = 0.95
     write_l1_hit_rate: float = 0.80
     write_l2_hit_rate: float = 0.90
+    cache_line_bytes: int = 64
+
+    def __post_init__(self) -> None:
+        positive = {
+            "dim": self.dim,
+            "input_bytes": self.input_bytes,
+            "acc_bytes": self.acc_bytes,
+            "sp_capacity_kib": self.sp_capacity_kib,
+            "acc_capacity_kib": self.acc_capacity_kib,
+            "sp_banks": self.sp_banks,
+            "acc_banks": self.acc_banks,
+            "dma_maxbytes": self.dma_maxbytes,
+            "dma_buswidth_bits": self.dma_buswidth_bits,
+            "frequency_hz": self.frequency_hz,
+            "cpu_peak_macs_per_cycle": self.cpu_peak_macs_per_cycle,
+            "cpu_peak_alu_ops_per_cycle": self.cpu_peak_alu_ops_per_cycle,
+            "l1_bandwidth_bytes_per_cycle": self.l1_bandwidth_bytes_per_cycle,
+            "l2_bandwidth_bytes_per_cycle": self.l2_bandwidth_bytes_per_cycle,
+            "dram_bandwidth_bytes_per_cycle": self.dram_bandwidth_bytes_per_cycle,
+            "cache_line_bytes": self.cache_line_bytes,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        precision_bytes = {
+            "int8": 1,
+            "int16": 2,
+            "int32": 4,
+            "int64": 8,
+            "fp16": 2,
+            "bf16": 2,
+            "fp32": 4,
+            "fp64": 8,
+        }
+        for prefix, precision, storage_bytes in (
+            ("input", self.input_precision, self.input_bytes),
+            ("acc", self.acc_precision, self.acc_bytes),
+        ):
+            expected_bytes = precision_bytes.get(precision)
+            if expected_bytes is None:
+                raise ValueError(f"unsupported {prefix}_precision: {precision}")
+            if expected_bytes != storage_bytes:
+                raise ValueError(
+                    f"{prefix}_precision={precision} requires {expected_bytes} bytes, "
+                    f"got {storage_bytes}"
+                )
+        for name in (
+            "random_l1_hit_rate",
+            "random_l2_hit_rate",
+            "sequential_l1_hit_rate",
+            "sequential_l2_hit_rate",
+            "write_l1_hit_rate",
+            "write_l2_hit_rate",
+        ):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}")
 
     @property
     def pe_count(self) -> int:
@@ -244,10 +408,27 @@ class HardwareParams:
         )
 
     @classmethod
+    def fp16_default(cls) -> "HardwareParams":
+        return cls(
+            name="GemminiFPConfigs.FP16DefaultConfig",
+            dim=4,
+            input_bytes=2,
+            acc_bytes=4,
+            input_precision="fp16",
+            acc_precision="fp32",
+            sp_capacity_kib=256.0,
+            acc_capacity_kib=64.0,
+            sp_banks=4,
+            acc_banks=1,
+            dma_maxbytes=64,
+            dma_buswidth_bits=128,
+        )
+
+    @classmethod
     def fp32_default(cls) -> "HardwareParams":
         return cls(
-            name="GemminiFP32DefaultConfig",
-            dim=8,
+            name="GemminiFPConfigs.FP32DefaultConfig",
+            dim=4,
             input_bytes=4,
             acc_bytes=4,
             input_precision="fp32",
@@ -263,7 +444,10 @@ class HardwareParams:
     @classmethod
     def from_gemmini_header(cls, path: Path = DEFAULT_GEMMINI_HEADER) -> "HardwareParams":
         if not path.exists():
-            return cls.default_int8()
+            raise FileNotFoundError(
+                f"generated Gemmini header not found: {path}. "
+                "Choose an explicit hardware profile or pass --gemmini-header."
+            )
 
         text = path.read_text()
 
@@ -322,6 +506,8 @@ class HardwareParams:
             return cls.from_gemmini_header(header_path)
         if profile == "default-int8":
             return cls.default_int8()
+        if profile == "fp16-default":
+            return cls.fp16_default()
         if profile == "fp32-default":
             return cls.fp32_default()
         if profile == "custom":
@@ -334,6 +520,15 @@ class EnergyTable:
     """Unit dynamic energy values in picojoules per action unit."""
 
     unit_pj: dict[str, float]
+
+    def __post_init__(self) -> None:
+        if not self.unit_pj:
+            raise ValueError("energy table must not be empty")
+        for name, value in self.unit_pj.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"unit energy must be finite and non-negative: {name}={value}"
+                )
 
     @classmethod
     def defaults(cls, hardware: HardwareParams) -> "EnergyTable":
@@ -349,24 +544,22 @@ class EnergyTable:
                 "fp32": 4.60,
                 "fp64": 18.00,
             }.get(hardware.input_precision, 1.40),
-            "cpu.mac": {
-                "int8": 0.80,
-                "int16": 1.60,
-                "fp16": 3.00,
-                "fp32": 8.00,
-            }.get(hardware.input_precision, 4.00),
+            "cpu.mac.int8": 0.80,
+            "cpu.mac.int16": 1.60,
+            "cpu.mac.fp16": 3.00,
+            "cpu.mac.fp32": 8.00,
+            "cpu.mac.fp64": 32.00,
             "cpu.alu": 1.00,
             "cpu.branch": 0.25,
             "cpu.atomic": 40.00,
             "sync.rocc": 200.00,
             "dma.read_byte": 0.60,
             "dma.write_byte": 0.70,
+            "dma.transaction": 20.00,
             "spad.read_byte": 1.00,
             "spad.write_byte": 1.20,
             "acc.read_byte": 1.20,
             "acc.write_byte": 1.50,
-            "pe.reg_read_byte": 0.20,
-            "pe.reg_write_byte": 0.25,
             "l1.sequential_read_byte": 1.10,
             "l1.random_read_byte": 1.40,
             "l1.write_byte": 1.50,
@@ -388,7 +581,15 @@ class EnergyTable:
             raise ValueError("energy table JSON must be an object mapping action names to pJ values")
         merged = dict(base.unit_pj)
         for key, value in data.items():
-            merged[str(key)] = float(value)
+            key = str(key)
+            value = float(value)
+            if key == "cpu.mac":
+                # Backward-compatible override for older tables. New tables
+                # should provide precision-specific CPU MAC actions.
+                for cpu_key in tuple(name for name in merged if name.startswith("cpu.mac.")):
+                    merged[cpu_key] = value
+            else:
+                merged[key] = value
         return cls(merged)
 
     def energy_pj(self, action_counts: dict[str, float]) -> float:

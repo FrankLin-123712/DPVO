@@ -60,11 +60,82 @@ class CpuEstimate:
     notes: str
 
 
+def choose_dense_blocking(
+    m_tiles: int,
+    n_tiles: int,
+    k_tiles: int,
+    a_tensor_bytes: int,
+    b_tensor_bytes: int,
+    operand_tile_bytes: int,
+    accumulator_tile_bytes: int,
+    hardware: HardwareParams,
+) -> tuple[int, int, int, int, int]:
+    """Choose a cheap capacity-feasible GEMM block.
+
+    An MxN output block stays in the accumulator while K panels stream
+    through the scratchpad.  This small analytical search captures the main
+    capacity/reload threshold without simulating individual cycles or banks.
+    """
+    spad_tiles = hardware.sp_capacity_bytes // operand_tile_bytes
+    acc_tiles = hardware.acc_capacity_bytes // accumulator_tile_bytes
+    if spad_tiles < 2 or acc_tiles < 1:
+        raise ValueError("Gemmini local memories cannot hold the minimum GEMM tile set")
+
+    best: tuple[float, int, int, int, int, int] | None = None
+    max_m_block = min(m_tiles, acc_tiles, spad_tiles - 1)
+    for m_block in range(1, max_m_block + 1):
+        max_n_block = min(
+            n_tiles,
+            acc_tiles // m_block,
+            spad_tiles - m_block,
+        )
+        for n_block in range(1, max_n_block + 1):
+            k_block = min(k_tiles, spad_tiles // (m_block + n_block))
+            if k_block < 1:
+                continue
+            a_reloads = ceil_div(n_tiles, n_block)
+            b_reloads = ceil_div(m_tiles, m_block)
+            read_bytes = a_tensor_bytes * a_reloads + b_tensor_bytes * b_reloads
+            # First minimize off-chip bytes.  Ties prefer fewer panels, a
+            # deeper K block, and a larger output block.
+            key = (
+                read_bytes,
+                a_reloads + b_reloads,
+                -k_block,
+                -(m_block * n_block),
+                m_block,
+                n_block,
+            )
+            if best is None or key < best:
+                best = key
+
+    if best is None:  # guarded by the minimum-capacity checks above
+        raise ValueError("no capacity-feasible Gemmini blocking was found")
+    _, _, neg_k_block, _, m_block, n_block = best
+    return (
+        m_block,
+        n_block,
+        -neg_k_block,
+        ceil_div(n_tiles, n_block),
+        ceil_div(m_tiles, m_block),
+    )
+
+
 def estimate_dense_on_gemmini(
     op: DenseOp,
     hardware: HardwareParams,
     overlap_dma_compute: bool,
+    dataflow: str = "WS",
 ) -> DenseEstimate:
+    if op.input_bytes != hardware.input_bytes or op.weight_bytes != hardware.input_bytes:
+        raise ValueError(
+            f"{op.name} uses {op.input_bytes}/{op.weight_bytes}-byte operands but "
+            f"{hardware.name} expects {hardware.input_bytes}-byte Gemmini operands. "
+            "Model quantization/precision conversion explicitly before offload."
+        )
+    if dataflow not in {"WS", "OS"}:
+        raise ValueError(f"unsupported Gemmini dataflow: {dataflow}")
+
     dim = hardware.dim
     padded_m = round_up(op.m, dim)
     padded_n = round_up(op.n, dim)
@@ -78,28 +149,59 @@ def estimate_dense_on_gemmini(
     executed_macs = padded_m * padded_n * padded_k
     utilization = useful_macs / executed_macs if executed_macs else 1.0
 
-    # A conservative reuse model: if an entire operand fits in half the
-    # scratchpad, load it once. Otherwise reload it across the orthogonal tile
-    # dimension.
-    a_tensor_bytes = op.m * op.k * hardware.input_bytes
-    b_tensor_bytes = op.k * op.n * hardware.input_bytes
-    c_tensor_bytes = op.m * op.n * hardware.acc_bytes
-    half_spad = max(1, hardware.sp_capacity_bytes // 2)
-    a_reuse_factor = 1 if a_tensor_bytes <= half_spad else n_tiles
-    b_reuse_factor = 1 if b_tensor_bytes <= half_spad else m_tiles
+    a_tensor_bytes = op.m * op.k * op.input_bytes
+    b_tensor_bytes = op.k * op.n * op.weight_bytes
+    output_bytes = op.m * op.n * op.output_bytes
 
-    dram_read_bytes = a_tensor_bytes * a_reuse_factor + b_tensor_bytes * b_reuse_factor
-    dram_write_bytes = op.m * op.n * hardware.input_bytes
+    operand_tile_bytes = dim * dim * hardware.input_bytes
+    accumulator_tile_bytes = dim * dim * hardware.acc_bytes
+    if 2 * operand_tile_bytes > hardware.sp_capacity_bytes:
+        raise ValueError(
+            f"scratchpad cannot hold one A/B tile pair for {op.name}: "
+            f"need {2 * operand_tile_bytes} B, have {hardware.sp_capacity_bytes} B"
+        )
+    if accumulator_tile_bytes > hardware.acc_capacity_bytes:
+        raise ValueError(
+            f"accumulator cannot hold one output tile for {op.name}: "
+            f"need {accumulator_tile_bytes} B, have {hardware.acc_capacity_bytes} B"
+        )
 
-    # Low-level SRAM/PE traffic. The arrays stream operands every executed MAC;
-    # accumulator traffic is per output tile per K tile.
-    spad_read_bytes = executed_macs * 2 * hardware.input_bytes
+    # Select an output block that fits both operand panels in SPAD and partial
+    # outputs in ACC. This avoids the pessimistic all-or-nothing rule that
+    # reloaded a complete A tensor for every N tile as soon as A exceeded half
+    # the scratchpad.
+    m_block, n_block, k_block, a_reload_factor, b_reload_factor = choose_dense_blocking(
+        m_tiles=m_tiles,
+        n_tiles=n_tiles,
+        k_tiles=k_tiles,
+        a_tensor_bytes=a_tensor_bytes,
+        b_tensor_bytes=b_tensor_bytes,
+        operand_tile_bytes=operand_tile_bytes,
+        accumulator_tile_bytes=accumulator_tile_bytes,
+        hardware=hardware,
+    )
+
+    dram_read_bytes = a_tensor_bytes * a_reload_factor + b_tensor_bytes * b_reload_factor
+    dram_write_bytes = output_bytes
+
+    # Count operand injection at tile granularity. Internal PE forwarding/reuse
+    # is represented by executed MAC energy and is not charged again as a SPAD
+    # read for every MAC.
+    a_spad_tiles = tile_products
+    b_spad_tiles = (
+        n_tiles * k_tiles * ceil_div(m_tiles, m_block)
+        if dataflow == "WS"
+        else tile_products
+    )
+    spad_read_bytes = (a_spad_tiles + b_spad_tiles) * operand_tile_bytes
     spad_write_bytes = dram_read_bytes
     acc_bytes_per_output = padded_m * padded_n * hardware.acc_bytes
-    acc_read_bytes = acc_bytes_per_output * max(0, k_tiles - 1)
-    acc_write_bytes = acc_bytes_per_output * k_tiles
-    pe_reg_read_bytes = executed_macs * 2 * hardware.input_bytes
-    pe_reg_write_bytes = executed_macs * hardware.acc_bytes / max(1, dim)
+    if dataflow == "WS":
+        acc_read_bytes = acc_bytes_per_output * max(0, k_tiles - 1)
+        acc_write_bytes = acc_bytes_per_output * k_tiles
+    else:
+        acc_read_bytes = 0
+        acc_write_bytes = acc_bytes_per_output
 
     actions = ActionCounts()
     actions.add("gemmini.mac", executed_macs)
@@ -111,23 +213,41 @@ def estimate_dense_on_gemmini(
     actions.add("spad.write_byte", spad_write_bytes)
     actions.add("acc.read_byte", acc_read_bytes)
     actions.add("acc.write_byte", acc_write_bytes)
-    actions.add("pe.reg_read_byte", pe_reg_read_bytes)
-    actions.add("pe.reg_write_byte", pe_reg_write_bytes)
+    actions.add(
+        "dma.transaction",
+        ceil_div(int(math.ceil(dram_read_bytes + dram_write_bytes)), hardware.dma_maxbytes),
+    )
     actions.add("sync.rocc", 1)
 
-    compute_cycles = math.ceil(executed_macs / max(1, hardware.pe_count))
-    fill_drain_cycles = tile_products * (2 * dim + k_tiles)
+    # K tiles for one output tile stream back-to-back. Pay the systolic
+    # fill/drain once per M/N output tile, avoiding the previous O(K_tiles^2)
+    # term.
+    compute_cycles = m_tiles * n_tiles * padded_k
+    fill_drain_cycles = m_tiles * n_tiles * max(0, 2 * dim - 2)
     dma_cycles = (dram_read_bytes + dram_write_bytes) / hardware.dma_bandwidth_bytes_per_cycle
     memory_cycles = (dram_read_bytes + dram_write_bytes) / hardware.dram_bandwidth_bytes_per_cycle
     command_cycles = hardware.rocc_command_cycles * max(1, m_tiles * n_tiles)
     if overlap_dma_compute:
-        cycles = max(compute_cycles + fill_drain_cycles, dma_cycles, memory_cycles) + command_cycles
+        cycles = (
+            max(compute_cycles + fill_drain_cycles, dma_cycles, memory_cycles)
+            + command_cycles
+            + hardware.cpu_sync_cycles
+        )
     else:
-        cycles = compute_cycles + fill_drain_cycles + dma_cycles + memory_cycles + command_cycles
+        cycles = (
+            compute_cycles
+            + fill_drain_cycles
+            + dma_cycles
+            + memory_cycles
+            + command_cycles
+            + hardware.cpu_sync_cycles
+        )
 
     notes = (
         f"{op.kind} {op.m}x{op.k} * {op.k}x{op.n}, "
-        f"tiles M/N/K={m_tiles}/{n_tiles}/{k_tiles}, util={utilization:.3f}"
+        f"tiles M/N/K={m_tiles}/{n_tiles}/{k_tiles}, "
+        f"block={m_block}/{n_block}/{k_block}, reload A/B={a_reload_factor}/{b_reload_factor}, "
+        f"dataflow={dataflow}, util={utilization:.3f}"
     )
     return DenseEstimate(
         actions=actions,
@@ -147,7 +267,7 @@ def estimate_dense_on_cpu(op: DenseOp, hardware: HardwareParams) -> CpuEstimate:
     write_bytes = op.m * op.n * op.output_bytes
     memory_read_hierarchy(actions, read_bytes, "sequential", hardware)
     memory_write_hierarchy(actions, write_bytes, hardware)
-    actions.add("cpu.mac", op.macs)
+    actions.add(cpu_mac_action(precision_from_bytes(op.input_bytes)), op.macs)
     actions.add("cpu.alu", op.m * op.n)
     actions.add("cpu.branch", max(1, op.m // 16))
 
@@ -173,12 +293,24 @@ def estimate_dense_on_cpu(op: DenseOp, hardware: HardwareParams) -> CpuEstimate:
 
 def estimate_irregular_on_cpu(work: IrregularWorkload, hardware: HardwareParams) -> CpuEstimate:
     actions = ActionCounts()
-    memory_read_hierarchy(actions, work.read_bytes, work.access_pattern, hardware)
+    memory_read_hierarchy(
+        actions,
+        work.read_bytes,
+        work.access_pattern,
+        hardware,
+        random_line_utilization=work.random_line_utilization,
+    )
     memory_write_hierarchy(actions, work.write_bytes, hardware)
     if work.metadata_bytes:
         actions.add("metadata.read_byte", work.metadata_bytes)
-        memory_read_hierarchy(actions, work.metadata_bytes, "random", hardware)
-    actions.add("cpu.mac", work.macs)
+        memory_read_hierarchy(
+            actions,
+            work.metadata_bytes,
+            "random",
+            hardware,
+            random_line_utilization=min(1.0, 8 / hardware.cache_line_bytes),
+        )
+    actions.add(cpu_mac_action(work.precision), work.macs)
     actions.add("cpu.alu", work.alu_ops)
     actions.add("cpu.atomic", work.atomics)
     actions.add("cpu.branch", work.branches)
@@ -191,7 +323,20 @@ def estimate_irregular_on_cpu(work: IrregularWorkload, hardware: HardwareParams)
         + work.branches * 0.25
     )
     l1_cycles = (work.read_bytes + work.write_bytes + work.metadata_bytes) / hardware.l1_bandwidth_bytes_per_cycle
-    l2_read, dram_read = lower_memory_bytes(work.read_bytes + work.metadata_bytes, work.access_pattern, hardware)
+    l2_read, dram_read = lower_memory_bytes(
+        work.read_bytes,
+        work.access_pattern,
+        hardware,
+        random_line_utilization=work.random_line_utilization,
+    )
+    metadata_l2, metadata_dram = lower_memory_bytes(
+        work.metadata_bytes,
+        "random",
+        hardware,
+        random_line_utilization=min(1.0, 8 / hardware.cache_line_bytes),
+    )
+    l2_read += metadata_l2
+    dram_read += metadata_dram
     l2_write, dram_write = lower_write_bytes(work.write_bytes, hardware)
     l2_cycles = (l2_read + l2_write) / hardware.l2_bandwidth_bytes_per_cycle
     dram_cycles = (dram_read + dram_write) / hardware.dram_bandwidth_bytes_per_cycle
@@ -213,11 +358,17 @@ def memory_read_hierarchy(
     bytes_: float,
     access_pattern: str,
     hardware: HardwareParams,
+    random_line_utilization: float = 1.0,
 ) -> None:
     if bytes_ <= 0:
         return
     pattern = "sequential" if access_pattern == "sequential" else "random"
-    l2_bytes, dram_bytes = lower_memory_bytes(bytes_, pattern, hardware)
+    l2_bytes, dram_bytes = lower_memory_bytes(
+        bytes_,
+        pattern,
+        hardware,
+        random_line_utilization=random_line_utilization,
+    )
     actions.add(f"l1.{pattern}_read_byte", bytes_)
     actions.add(f"l2.{pattern}_read_byte", l2_bytes)
     actions.add(f"dram.{pattern}_read_byte", dram_bytes)
@@ -232,14 +383,27 @@ def memory_write_hierarchy(actions: ActionCounts, bytes_: float, hardware: Hardw
     actions.add("dram.write_byte", dram_bytes)
 
 
-def lower_memory_bytes(bytes_: float, access_pattern: str, hardware: HardwareParams) -> tuple[float, float]:
+def lower_memory_bytes(
+    bytes_: float,
+    access_pattern: str,
+    hardware: HardwareParams,
+    random_line_utilization: float = 1.0,
+) -> tuple[float, float]:
+    if bytes_ <= 0:
+        return 0.0, 0.0
     if access_pattern == "sequential":
         h1 = hardware.sequential_l1_hit_rate
         h2 = hardware.sequential_l2_hit_rate
+        transferred_bytes = bytes_
     else:
         h1 = hardware.random_l1_hit_rate
         h2 = hardware.random_l2_hit_rate
-    l2_bytes = bytes_ * (1 - h1)
+        if not 0.0 < random_line_utilization <= 1.0:
+            raise ValueError("random_line_utilization must be in (0, 1]")
+        useful_per_line = hardware.cache_line_bytes * random_line_utilization
+        unique_lines = math.ceil(bytes_ / useful_per_line)
+        transferred_bytes = unique_lines * hardware.cache_line_bytes
+    l2_bytes = transferred_bytes * (1 - h1)
     dram_bytes = l2_bytes * (1 - h2)
     return l2_bytes, dram_bytes
 
@@ -248,3 +412,17 @@ def lower_write_bytes(bytes_: float, hardware: HardwareParams) -> tuple[float, f
     l2_bytes = bytes_ * (1 - hardware.write_l1_hit_rate)
     dram_bytes = l2_bytes * (1 - hardware.write_l2_hit_rate)
     return l2_bytes, dram_bytes
+
+
+def precision_from_bytes(dtype_bytes: int) -> str:
+    try:
+        return {1: "int8", 2: "fp16", 4: "fp32", 8: "fp64"}[dtype_bytes]
+    except KeyError as exc:
+        raise ValueError(f"unsupported CPU operand width: {dtype_bytes} bytes") from exc
+
+
+def cpu_mac_action(precision: str) -> str:
+    supported = {"int8", "int16", "fp16", "fp32", "fp64"}
+    if precision not in supported:
+        raise ValueError(f"unsupported CPU MAC precision: {precision}")
+    return f"cpu.mac.{precision}"

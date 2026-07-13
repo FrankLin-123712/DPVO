@@ -58,6 +58,7 @@ class EnergyReport:
     mapping: MappingParams
     energy_table: dict[str, float]
     modules: tuple[ModuleResult, ...]
+    target_fps: float | None = None
 
     @property
     def total_energy_pj(self) -> float:
@@ -82,6 +83,18 @@ class EnergyReport:
         if self.total_seconds <= 0:
             return math.inf
         return 1.0 / self.total_seconds
+
+    @property
+    def target_dynamic_power_w(self) -> float | None:
+        if self.target_fps is None:
+            return None
+        return self.total_energy_pj * 1e-12 * self.target_fps
+
+    @property
+    def target_throughput_feasible(self) -> bool | None:
+        if self.target_fps is None:
+            return None
+        return self.frames_per_second >= self.target_fps
 
     def aggregate_actions(self) -> dict[str, float]:
         totals: dict[str, float] = {}
@@ -108,7 +121,11 @@ class EnergyReport:
                 "cycles_per_frame": self.total_cycles,
                 "seconds_per_frame": self.total_seconds,
                 "estimated_fps": self.frames_per_second,
+                "active_dynamic_power_w": self.dynamic_power_w,
                 "dynamic_power_w": self.dynamic_power_w,
+                "target_fps": self.target_fps,
+                "target_dynamic_power_w": self.target_dynamic_power_w,
+                "target_throughput_feasible": self.target_throughput_feasible,
             },
             "modules": modules,
         }
@@ -181,8 +198,14 @@ class EnergyReport:
             f"Energy/frame: {human_energy_j(self.total_energy_pj * 1e-12)}; "
             f"Latency/frame: {human_seconds(self.total_seconds)}; "
             f"Throughput: {self.frames_per_second:.2f} frame/s; "
-            f"Dynamic power: {self.dynamic_power_w:.3f} W"
+            f"Active dynamic power: {self.dynamic_power_w:.3f} W"
         )
+        if self.target_fps is not None:
+            lines.append(
+                f"At target {self.target_fps:.2f} frame/s: "
+                f"dynamic power={self.target_dynamic_power_w:.3f} W; "
+                f"feasible={'yes' if self.target_throughput_feasible else 'no'}"
+            )
         lines.append(
             f"Hardware: {self.hardware.name}, DIM={self.hardware.dim}, "
             f"{self.hardware.input_precision} input, {self.hardware.acc_precision} acc, "
@@ -210,7 +233,10 @@ def estimate_energy(
     hardware: HardwareParams,
     mapping: MappingParams | None = None,
     energy_table: EnergyTable | None = None,
+    target_fps: float | None = None,
 ) -> EnergyReport:
+    if target_fps is not None and target_fps <= 0:
+        raise ValueError(f"target_fps must be positive, got {target_fps}")
     mapping = mapping or MappingParams()
     energy_table = energy_table or EnergyTable.defaults(hardware)
     module_results = [
@@ -223,6 +249,7 @@ def estimate_energy(
         mapping=mapping,
         energy_table=energy_table.as_dict(),
         modules=tuple(module_results),
+        target_fps=target_fps,
     )
 
 
@@ -242,15 +269,39 @@ def estimate_module(
     dram_read_bytes = 0.0
     dram_write_bytes = 0.0
     notes: list[str] = []
+    effective_mappings: set[str] = set()
+
+    if workload.name == "correlation_lookup" and module_mapping == "gemmini":
+        raise NotImplementedError(
+            "Gemmini correlation mapping is intentionally disabled: each edge/patch row "
+            "has a different candidate tensor and is not a conventional shared-B GEMM."
+        )
 
     dense_ops = selected_dense_ops(workload, module_mapping)
     irregular = selected_irregular_workloads(workload, module_mapping)
 
     for op in dense_ops:
         if module_mapping == "gemmini":
-            estimate = estimate_dense_on_gemmini(op, hardware, mapping.overlap_dma_compute)
+            gemmini_estimate = estimate_dense_on_gemmini(
+                op,
+                hardware,
+                mapping.overlap_dma_compute,
+                mapping.dataflow,
+            )
+            if gemmini_estimate.utilization < mapping.gemmini_min_utilization_for_offload:
+                estimate = estimate_dense_on_cpu(op, hardware)
+                effective_mappings.add("cpu-auto")
+                notes.append(
+                    f"{op.name} kept on CPU because Gemmini utilization "
+                    f"{gemmini_estimate.utilization:.3f} is below "
+                    f"{mapping.gemmini_min_utilization_for_offload:.3f}"
+                )
+            else:
+                estimate = gemmini_estimate
+                effective_mappings.add("gemmini")
         elif module_mapping == "cpu":
             estimate = estimate_dense_on_cpu(op, hardware)
+            effective_mappings.add("cpu")
         else:
             raise ValueError(f"unsupported mapping {module_mapping} for dense op {op.name}")
         actions.merge(estimate.actions)
@@ -267,6 +318,7 @@ def estimate_module(
         if module_mapping not in {"cpu", "gemmini"}:
             raise ValueError(f"unsupported mapping {module_mapping} for irregular work {work.name}")
         estimate = estimate_irregular_on_cpu(work, hardware)
+        effective_mappings.add("cpu")
         actions.merge(estimate.actions)
         useful_macs += estimate.useful_macs
         executed_macs += estimate.executed_macs
@@ -286,7 +338,7 @@ def estimate_module(
     seconds = cycles / hardware.frequency_hz
     return ModuleResult(
         module=workload.name,
-        mapping=module_mapping,
+        mapping="+".join(sorted(effective_mappings)) if effective_mappings else module_mapping,
         useful_macs=useful_macs,
         executed_macs=executed_macs,
         utilization=utilization,
@@ -317,9 +369,12 @@ def selected_irregular_workloads(workload: ModuleWorkload, module_mapping: str) 
 def mapping_for_module(module_name: str, mapping: MappingParams) -> str:
     table = {
         "feature_context_encoder": mapping.encoder,
+        "feature_pyramid_pooling": "cpu",
         "patch_extraction": mapping.patch_extraction,
+        "update_geometry_elementwise": mapping.geometry,
         "correlation_lookup": mapping.correlation,
         "update_dense_linears": mapping.update_dense,
+        "factor_heads": mapping.factor_head,
         "soft_aggregation_scatter": mapping.soft_aggregation,
         "bundle_adjustment": mapping.ba,
         "graph_management": mapping.graph_management,

@@ -90,7 +90,13 @@ class IrregularWorkload:
     branches: int = 0
     syncs: int = 0
     access_pattern: str = "random"
+    precision: str = "fp32"
+    random_line_utilization: float = 0.25
     notes: str = ""
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.random_line_utilization <= 1.0:
+            raise ValueError("random_line_utilization must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,10 @@ class ModuleWorkload:
 
 def conv_out(size: int, kernel: int, stride: int, padding: int, dilation: int = 1) -> int:
     return (size + 2 * padding - dilation * (kernel - 1) - 1) // stride + 1
+
+
+def floating_precision(dtype_bytes: int) -> str:
+    return {1: "int8", 2: "fp16", 4: "fp32", 8: "fp64"}[dtype_bytes]
 
 
 def build_basic_encoder4_layers(height: int, width: int, output_dim: int, prefix: str) -> list[ConvLayer]:
@@ -205,6 +215,8 @@ def build_patch_extraction(params: AlgorithmParams) -> ModuleWorkload:
                 alu_ops=alu_ops,
                 branches=branches,
                 access_pattern="random",
+                precision=floating_precision(dtype_bytes),
+                random_line_utilization=0.25,
                 notes=notes,
             ),
         ),
@@ -237,16 +249,18 @@ def build_correlation(params: AlgorithmParams) -> ModuleWorkload:
         alu_ops=output_values * 8,
         branches=edges * levels * p * p,
         access_pattern="random",
+        precision=floating_precision(dtype_bytes),
+        random_line_utilization=0.50,
         notes="default model treats local correlation as semi-irregular gather + dot",
     )
 
-    # Alternative Gemmini-friendly representation if the caller selects
-    # --corr-mapping gemmini: build each edge/patch sample as a row and each
-    # local candidate as a column. The gather/staging traffic is still charged.
+    # Descriptor retained for future block-batched accelerator modeling. It is
+    # not exposed by the CLI because every row has a different candidate tensor
+    # and therefore is not a conventional shared-B GEMM.
     dense = DenseOp(
         name="correlation.batched_dot",
         m=edges * p * p,
-        n=levels * output_diameter * output_diameter,
+        n=levels * dot_diameter * dot_diameter,
         k=GMAP_DIM,
         input_bytes=dtype_bytes,
         weight_bytes=dtype_bytes,
@@ -264,6 +278,8 @@ def build_correlation(params: AlgorithmParams) -> ModuleWorkload:
         alu_ops=output_values * 4,
         branches=edges * levels,
         access_pattern="random",
+        precision=floating_precision(dtype_bytes),
+        random_line_utilization=0.50,
         notes="cost to gather local correlation operands before Gemmini GEMM",
     )
 
@@ -292,23 +308,30 @@ def build_update_dense(params: AlgorithmParams) -> ModuleWorkload:
         ops.append(dense_linear(f"update.{branch}.0", edges, DPVO_DIM, DPVO_DIM, dtype_bytes))
         ops.append(dense_linear(f"update.{branch}.2", edges, DPVO_DIM, DPVO_DIM, dtype_bytes))
 
-    for agg in ("agg_kk", "agg_ij"):
-        for proj in ("f", "g", "h"):
+    aggregation_groups = {
+        "agg_kk": params.active_unique_patches,
+        "agg_ij": params.active_unique_frame_pairs,
+    }
+    for agg, groups in aggregation_groups.items():
+        for proj in ("f", "g"):
             ops.append(dense_linear(f"update.{agg}.{proj}", edges, DPVO_DIM, DPVO_DIM, dtype_bytes))
+        # SoftAgg applies h to the reduced unique-group tensor, then expands
+        # the result back to edges. It is not an E-row linear operation.
+        ops.append(dense_linear(f"update.{agg}.h", groups, DPVO_DIM, DPVO_DIM, dtype_bytes))
 
     for block in range(2):
         ops.append(dense_linear(f"update.gru.{block}.gate", edges, DPVO_DIM, DPVO_DIM, dtype_bytes))
         ops.append(dense_linear(f"update.gru.{block}.res0", edges, DPVO_DIM, DPVO_DIM, dtype_bytes))
         ops.append(dense_linear(f"update.gru.{block}.res2", edges, DPVO_DIM, DPVO_DIM, dtype_bytes))
 
-    ops.append(dense_linear("update.delta_head", edges, DPVO_DIM, 2, dtype_bytes))
-    ops.append(dense_linear("update.weight_head", edges, DPVO_DIM, 2, dtype_bytes))
-
     return ModuleWorkload(
         name="update_dense_linears",
         preferred_mapping="gemmini",
         dense_ops=tuple(ops),
-        notes=f"Update MLP/GRU/SoftAgg projection linears, E={edges}, DIM={DPVO_DIM}",
+        notes=(
+            f"Update linears, E={edges}, kk_groups={params.active_unique_patches}, "
+            f"ij_groups={params.active_unique_frame_pairs}, DIM={DPVO_DIM}"
+        ),
     )
 
 
@@ -335,6 +358,8 @@ def build_soft_aggregation(params: AlgorithmParams) -> ModuleWorkload:
                 atomics=atomics,
                 branches=edges,
                 access_pattern="random",
+                precision=floating_precision(dtype_bytes),
+                random_line_utilization=0.25,
                 notes="torch.unique + scatter_softmax + scatter_sum over kk groups",
             ),
             IrregularWorkload(
@@ -348,6 +373,8 @@ def build_soft_aggregation(params: AlgorithmParams) -> ModuleWorkload:
                 atomics=atomics,
                 branches=edges,
                 access_pattern="random",
+                precision=floating_precision(dtype_bytes),
+                random_line_utilization=0.25,
                 notes="torch.unique + scatter_softmax + scatter_sum over ii/jj groups",
             ),
         ),
@@ -362,13 +389,18 @@ def build_ba(params: AlgorithmParams) -> ModuleWorkload:
     poses = params.optimization_window
     state_dim = 6 * poses
 
-    input_bytes_per_edge = (2 * 7 + 3 + 2 + 2 + 4) * 4 + 3 * 8
-    block_atomic_bytes = (
-        2 * 4 * 36 * 2 * dtype_bytes
-        + 2 * 2 * 6 * 2 * dtype_bytes
-        + 2 * 2 * 6 * 2 * dtype_bytes
-        + 2 * 3 * 2 * dtype_bytes
-    )
+    input_bytes_per_edge = (2 * 7 + 3 + 2 + 2 + 4) * 4
+
+    # In the CUDA kernel, B/E/v atomics are conditional on whether ii/jj are
+    # inside the optimization window. Use an expected active-pose fraction
+    # instead of the previous fixed 96 atomics/edge. At fraction=1 this gives
+    # 342 atomicAdd operations per edge/iteration (including scalar terms).
+    optimized_pose_fraction = min(1.0, poses / max(1, params.active_source_frames))
+    b_atomics = 144 * optimized_pose_fraction + 144 * optimized_pose_fraction**2
+    e_v_atomics = 48 * optimized_pose_fraction
+    scalar_atomics = 6
+    atomics_per_edge = int(round(b_atomics + e_v_atomics + scalar_atomics))
+    block_atomic_bytes = atomics_per_edge * 2 * dtype_bytes
     jacobian_bytes_per_edge = input_bytes_per_edge + block_atomic_bytes
 
     jacobian = IrregularWorkload(
@@ -379,11 +411,18 @@ def build_ba(params: AlgorithmParams) -> ModuleWorkload:
         write_bytes=edges * iters * block_atomic_bytes,
         metadata_bytes=edges * iters * 3 * 8,
         macs=edges * iters * params.ba_macs_per_edge,
-        alu_ops=edges * iters * params.ba_macs_per_edge,
-        atomics=edges * iters * 96,
+        # ba_macs_per_edge is an effective compute count; do not charge the
+        # same work again as a second ALU action.
+        alu_ops=0,
+        atomics=edges * iters * atomics_per_edge,
         branches=edges * iters * 8,
         access_pattern="random",
-        notes=f"local fastba.BA residual/Jacobian/Hessian assembly, {jacobian_bytes_per_edge} B/edge/iter",
+        precision=floating_precision(dtype_bytes),
+        random_line_utilization=0.50,
+        notes=(
+            "local fastba.BA residual/Jacobian/Hessian assembly, "
+            f"{jacobian_bytes_per_edge} B and {atomics_per_edge} expected atomics/edge/iter"
+        ),
     )
 
     eqet = state_dim * unique_patches * state_dim
@@ -411,9 +450,11 @@ def build_ba(params: AlgorithmParams) -> ModuleWorkload:
         write_bytes=iters * (state_dim * state_dim + state_dim + unique_patches) * dtype_bytes,
         metadata_bytes=unique_patches * 8 + poses * 8,
         macs=schur_macs,
-        alu_ops=schur_macs,
+        alu_ops=0,
         branches=iters * (unique_patches + poses),
         access_pattern="sequential",
+        precision=floating_precision(dtype_bytes),
+        random_line_utilization=1.0,
         notes=f"state_dim={state_dim}, unique_patches={unique_patches}",
     )
 
@@ -450,7 +491,107 @@ def build_graph_management(params: AlgorithmParams) -> ModuleWorkload:
                 branches=(new_edges + active_edges) * 4,
                 syncs=2,
                 access_pattern="random",
+                precision=floating_precision(dtype_bytes),
+                random_line_utilization=0.25,
                 notes="append forward/back factors, keyframe removal, state ring-buffer updates",
+            ),
+        ),
+    )
+
+
+def build_factor_heads(params: AlgorithmParams) -> ModuleWorkload:
+    edges = params.active_edges
+    dtype_bytes = params.nn_dtype_bytes
+    return ModuleWorkload(
+        name="factor_heads",
+        preferred_mapping="gemmini",
+        dense_ops=(
+            dense_linear("update.delta_head", edges, DPVO_DIM, 2, dtype_bytes),
+            dense_linear("update.weight_head", edges, DPVO_DIM, 2, dtype_bytes),
+        ),
+        notes=f"delta/weight heads, E={edges}, DIM={DPVO_DIM}",
+    )
+
+
+def build_feature_pyramid_pooling(params: AlgorithmParams) -> ModuleWorkload:
+    dtype_bytes = params.nn_dtype_bytes
+    h = params.feature_height
+    w = params.feature_width
+    fmap_values = FNET_DIM * h * w
+    pooled_values = FNET_DIM * ((h + 3) // 4) * ((w + 3) // 4)
+    return ModuleWorkload(
+        name="feature_pyramid_pooling",
+        preferred_mapping="cpu",
+        irregular=(
+            IrregularWorkload(
+                name="fmap_store_and_pool4",
+                kind="sequential-pool-copy",
+                elements=fmap_values + pooled_values,
+                read_bytes=fmap_values * dtype_bytes,
+                write_bytes=(fmap_values + pooled_values) * dtype_bytes,
+                alu_ops=fmap_values,
+                access_pattern="sequential",
+                precision=floating_precision(dtype_bytes),
+                random_line_utilization=1.0,
+                notes="store fmap1 and build the /4 correlation pyramid level",
+            ),
+        ),
+    )
+
+
+def build_update_geometry_elementwise(params: AlgorithmParams) -> ModuleWorkload:
+    edges = params.active_edges
+    p = params.patch_size
+    nn_bytes = params.nn_dtype_bytes
+    fp32 = 4
+
+    reprojection_points = edges * p * p
+    reprojection_read = edges * ((2 * 7 + 4) * fp32 + 3 * p * p * fp32)
+    reprojection_write = reprojection_points * 2 * fp32
+
+    feature_values = edges * DPVO_DIM
+    active_points = params.active_unique_patches
+
+    return ModuleWorkload(
+        name="update_geometry_elementwise",
+        preferred_mapping="cpu",
+        irregular=(
+            IrregularWorkload(
+                name="projective_reprojection",
+                kind="se3-transform-project",
+                elements=reprojection_points,
+                read_bytes=reprojection_read,
+                write_bytes=reprojection_write,
+                alu_ops=reprojection_points * 60,
+                branches=edges * p * p,
+                access_pattern="random",
+                precision="fp32",
+                random_line_utilization=0.50,
+                notes="pops.transform before correlation",
+            ),
+            IrregularWorkload(
+                name="update_norm_activation_elementwise",
+                kind="layernorm-gating-residual",
+                elements=feature_values,
+                read_bytes=feature_values * nn_bytes * 8,
+                write_bytes=feature_values * nn_bytes * 4,
+                alu_ops=feature_values * 30,
+                access_pattern="sequential",
+                precision=floating_precision(nn_bytes),
+                random_line_utilization=1.0,
+                notes="LayerNorm, activation, gating, masks, residual adds, and target/weight preparation",
+            ),
+            IrregularWorkload(
+                name="point_cloud_update",
+                kind="projective-point-cloud",
+                elements=active_points,
+                read_bytes=active_points * (3 * p * p + 7 + 4) * fp32,
+                write_bytes=active_points * 3 * fp32,
+                alu_ops=active_points * 40,
+                access_pattern="sequential",
+                precision="fp32",
+                random_line_utilization=1.0,
+                notes="first-order active-window approximation of pops.point_cloud",
             ),
         ),
     )
@@ -459,9 +600,12 @@ def build_graph_management(params: AlgorithmParams) -> ModuleWorkload:
 def build_dpvo_workloads(params: AlgorithmParams) -> list[ModuleWorkload]:
     workloads = [
         build_feature_encoder(params),
+        build_feature_pyramid_pooling(params),
         build_patch_extraction(params),
+        build_update_geometry_elementwise(params),
         build_correlation(params),
         build_update_dense(params),
+        build_factor_heads(params),
         build_soft_aggregation(params),
         build_ba(params),
         build_graph_management(params),
@@ -471,7 +615,14 @@ def build_dpvo_workloads(params: AlgorithmParams) -> list[ModuleWorkload]:
         return workloads
 
     scaled: list[ModuleWorkload] = []
-    repeated_names = {"correlation_lookup", "update_dense_linears", "soft_aggregation_scatter", "bundle_adjustment"}
+    repeated_names = {
+        "update_geometry_elementwise",
+        "correlation_lookup",
+        "update_dense_linears",
+        "factor_heads",
+        "soft_aggregation_scatter",
+        "bundle_adjustment",
+    }
     for workload in workloads:
         if workload.name not in repeated_names:
             scaled.append(workload)
@@ -509,6 +660,8 @@ def scale_workload(workload: ModuleWorkload, factor: int) -> ModuleWorkload:
             branches=work.branches * factor,
             syncs=work.syncs * factor,
             access_pattern=work.access_pattern,
+            precision=work.precision,
+            random_line_utilization=work.random_line_utilization,
             notes=work.notes,
         )
         for work in workload.irregular
