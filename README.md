@@ -49,7 +49,26 @@ wget https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
 unzip eigen-3.4.0.zip -d thirdparty
 
 # install DPVO
-pip install .
+# DPVO's setup.py imports torch while building CUDA extensions. With recent pip
+# versions, plain `pip install .` may fail because pip builds in an isolated env
+# that cannot see the PyTorch package installed in the active conda env.
+# Use --no-build-isolation so setup.py can use that active PyTorch install.
+#
+# CUDA_HOME and TORCH_CUDA_ARCH_LIST are machine-dependent:
+#   1. CUDA_HOME must point to a CUDA toolkit that provides nvcc.
+#   2. The nvcc CUDA major version should match torch.version.cuda.
+#      For example, PyTorch cu121 should use a CUDA 12.x toolkit.
+#   3. TORCH_CUDA_ARCH_LIST should match the target GPU compute capability.
+#      8.6+PTX is suitable for many Ampere GPUs, but may not be optimal for
+#      Turing, Volta, Ada, Hopper, or other GPU generations.
+#
+# Check the active PyTorch CUDA version with:
+#   python -c "import torch; print(torch.__version__, torch.version.cuda)"
+# Check the selected CUDA compiler with:
+#   $CUDA_HOME/bin/nvcc --version
+#
+# Example for this machine:
+CUDA_HOME=/usr/local/cuda-12.3 TORCH_CUDA_ARCH_LIST="8.6+PTX" pip install --no-build-isolation .
 
 # download models and data (~2GB)
 ./download_models_and_data.sh

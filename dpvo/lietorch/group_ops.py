@@ -1,6 +1,7 @@
-import lietorch_backends
 import torch
 import torch.nn.functional as F
+
+import lietorch_backends
 
 
 
@@ -99,4 +100,3 @@ class ToVec(torch.autograd.Function):
         inputs = ctx.saved_tensors
         J = lietorch_backends.projector(ctx.group_id, *inputs)
         return None, torch.matmul(grad.unsqueeze(-2), J).squeeze(-2)
-
