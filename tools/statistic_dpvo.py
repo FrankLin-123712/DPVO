@@ -1405,8 +1405,22 @@ TABLE_HEADERS = [
 ]
 
 
+def format_si_number(value: int) -> str:
+    """Format an integer with decimal SI units (K=10^3, M=10^6, ...)."""
+    units = ("", "K", "M", "G", "T", "P")
+    scaled = float(value)
+    unit_index = 0
+    while abs(scaled) >= 1000.0 and unit_index < len(units) - 1:
+        scaled /= 1000.0
+        unit_index += 1
+    if unit_index == 0:
+        return str(value)
+    number = f"{scaled:.3f}".rstrip("0").rstrip(".")
+    return f"{number}{units[unit_index]}"
+
+
 def display_row(row: LayerRow, human: bool) -> dict[str, str | int]:
-    number = (lambda value: f"{value:,}") if human else (lambda value: value)
+    number = format_si_number if human else (lambda value: value)
     invocations: str | int = "-" if row.invocations == 0 else row.invocations
     return {
         "Module": row.module,
@@ -1449,7 +1463,7 @@ def render_csv(rows: Sequence[LayerRow]) -> str:
     writer = csv.DictWriter(buffer, fieldnames=TABLE_HEADERS)
     writer.writeheader()
     for row in rows:
-        writer.writerow(display_row(row, human=False))
+        writer.writerow(display_row(row, human=True))
     return buffer.getvalue()
 
 
@@ -1642,7 +1656,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="all",
         help="all preserves ONNX node boundaries; compute hides zero-arithmetic metadata/view nodes.",
     )
-    parser.add_argument("--detail", choices=("layer", "module"), default="layer")
+    granularity = parser.add_mutually_exclusive_group()
+    granularity.add_argument(
+        "--per-module",
+        dest="detail",
+        action="store_const",
+        const="module",
+        help="Aggregate all canonical layers belonging to the same module into one output row.",
+    )
+    granularity.add_argument(
+        "--per-layer",
+        dest="detail",
+        action="store_const",
+        const="layer",
+        help="Output one row per canonical ONNX/C++ layer (default).",
+    )
+    granularity.add_argument(
+        "--detail",
+        choices=("layer", "module"),
+        help="Backward-compatible alias for --per-layer/--per-module.",
+    )
+    parser.set_defaults(detail="layer")
     parser.add_argument("--format", choices=("markdown", "csv", "json"), default="markdown")
     parser.add_argument("--output", type=Path)
     return parser.parse_args(argv)
@@ -1669,6 +1703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "updates_per_frame": args.updates_per_frame,
             "keyframe_test_included": not args.no_keyframe,
             "onnx_node_filter": args.onnx_nodes,
+            "output_granularity": f"per-{args.detail}",
         },
         "derived": {key: value for key, value in asdict(graph).items() if key != "pairs"},
         "counting_convention": {
@@ -1676,6 +1711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "layer_memory": "read every input/weight/metadata tensor once; write every output tensor once",
             "cross_layer_reuse": "forbidden",
             "within_layer_reuse": "allowed",
+            "display_units": "Markdown/CSV use decimal SI units (K=10^3, M=10^6, G=10^9); JSON stores exact integers",
             "onnx_precision": "from exported TensorProto (checked-in models are float32)",
             "ba_path": "source-level valid-residual path; implementation container/address overhead excluded",
             "data_dependent_control": "initialized accepted-frame path; motion-probe/bootstrap and optional loop closure excluded; keyframe frame-removal outcome represented by active_frames",
@@ -1707,6 +1743,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "",
             "Counting: MAC=2 ops; every layer rereads input/weight/metadata and writes its complete output.",
+            "",
+            "Display units: K=10^3, M=10^6, G=10^9 (JSON retains exact integers).",
             "",
             render_markdown(output_rows),
             "",

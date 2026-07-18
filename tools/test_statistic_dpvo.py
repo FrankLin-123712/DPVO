@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -132,6 +135,38 @@ class StatisticDpvoTests(unittest.TestCase):
         ):
             self.assertIn(column, header)
         self.assertIn("TOTAL,TOTAL", rendered)
+        self.assertIn(statistic.format_si_number(total.total_ops), rendered)
+        self.assertIn(statistic.format_si_number(total.total_memory_bytes), rendered)
+
+    def test_decimal_si_number_format(self) -> None:
+        self.assertEqual(statistic.format_si_number(0), "0")
+        self.assertEqual(statistic.format_si_number(999), "999")
+        self.assertEqual(statistic.format_si_number(1_000), "1K")
+        self.assertEqual(statistic.format_si_number(38_592), "38.592K")
+        self.assertEqual(statistic.format_si_number(614_400), "614.4K")
+        self.assertEqual(statistic.format_si_number(12_419_481_600), "12.419G")
+
+    def test_new_granularity_flags_are_mutually_exclusive(self) -> None:
+        self.assertEqual(statistic.parse_args(["--per-module"]).detail, "module")
+        self.assertEqual(statistic.parse_args(["--per-layer"]).detail, "layer")
+        self.assertEqual(statistic.parse_args([]).detail, "layer")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            statistic.parse_args(["--per-module", "--per-layer"])
+
+    def test_per_module_json_aggregates_rows_without_changing_total(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "module.json"
+            result = statistic.main(
+                ["--per-module", "--format", "json", "--output", str(output)]
+            )
+            self.assertEqual(result, 0)
+            payload = json.loads(output.read_text())
+        expected_modules = list(dict.fromkeys(row.module for row in self.rows))
+        self.assertEqual(payload["workload"]["output_granularity"], "per-module")
+        self.assertEqual(len(payload["rows"]), len(expected_modules))
+        self.assertTrue(all(row["layer"] == "MODULE TOTAL" for row in payload["rows"]))
+        self.assertEqual(payload["total"]["total_ops"], statistic.sum_rows(self.rows).total_ops)
+        self.assertIsInstance(payload["total"]["total_ops"], int)
 
 
 if __name__ == "__main__":
