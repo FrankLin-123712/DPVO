@@ -323,8 +323,10 @@ class DPVO:
         self.pg.normalize()
         lmbda = torch.as_tensor([1e-4], device="cuda")
         t0 = self.pg.ii.min().item()
-        fastba.BA(self.poses, self.patches, self.intrinsics,
-            full_target, full_weight, lmbda, full_ii, full_jj, full_kk, t0, self.n, M=self.M, iterations=2, eff_impl=True)
+        fastba.BA(
+            self.poses, self.patches, self.intrinsics,
+            full_target, full_weight, lmbda, full_ii, full_jj, full_kk,
+            t0, self.n, M=self.M, iterations=self.cfg.BA_ITERATIONS, eff_impl=True)
         self.ran_global_ba[self.n] = True
 
     def update(self):
@@ -355,8 +357,10 @@ class DPVO:
                 with Timer("ba/local", enabled=self.enable_timing):
                     t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
                     t0 = max(t0, 1)
-                    fastba.BA(self.poses, self.patches, self.intrinsics, 
-                        target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
+                    fastba.BA(
+                        self.poses, self.patches, self.intrinsics,
+                        target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk,
+                        t0, self.n, M=self.M, iterations=self.cfg.BA_ITERATIONS, eff_impl=False)
         except:
             print("Warning BA failed...")
 

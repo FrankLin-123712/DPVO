@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "config" / "default.yaml"
 DEFAULT_ONNX_DIR = REPO_ROOT / "exported_models"
 DEFAULT_ACTIVE_FRAMES = 64

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for statistic_dpvo.py."""
+"""Regression tests for statistic_dpvo/statistic_dpvo.py."""
 
 from __future__ import annotations
 
