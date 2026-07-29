@@ -62,7 +62,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=0, help="Explicit resized height. Must be used with --width.")
     parser.add_argument("--width", type=int, default=0, help="Explicit resized width. Must be used with --height.")
     parser.add_argument("--stride", type=int, default=2)
-    parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--backend-thresh", type=float, default=32.0)
     parser.add_argument("--segment-lengths", nargs="+", type=float, default=DEFAULT_SEGMENT_LENGTHS)
@@ -153,6 +153,19 @@ def projection_key_for_image_folder(image_folder: str) -> str:
     return "P2"
 
 
+def select_projection(
+    calib: dict[str, "np.ndarray"],
+    image_folder: str,
+    calib_path: Path,
+) -> tuple[str, "np.ndarray"]:
+    projection_key = projection_key_for_image_folder(image_folder)
+    for key in (projection_key, "P2", "P0"):
+        projection = calib.get(key)
+        if projection is not None:
+            return key, projection
+    raise KeyError(f"missing {projection_key}/P2/P0 calibration in {calib_path}")
+
+
 def align_down(value: float, multiple: int = ALIGNMENT) -> int:
     aligned = int(value) // multiple * multiple
     return max(multiple, aligned)
@@ -185,15 +198,9 @@ def iter_images(
     if not image_paths:
         raise FileNotFoundError(f"no KITTI images found under {image_dir}")
 
-    calib = read_calib_file(sequence_dir / "calib.txt")
-    projection_key = projection_key_for_image_folder(args.image_folder)
-    projection = calib.get(projection_key)
-    if projection is None:
-        projection = calib.get("P2")
-    if projection is None:
-        projection = calib.get("P0")
-    if projection is None:
-        raise KeyError(f"missing {projection_key}/P2/P0 calibration in {sequence_dir / 'calib.txt'}")
+    calib_path = sequence_dir / "calib.txt"
+    calib = read_calib_file(calib_path)
+    _, projection = select_projection(calib, args.image_folder, calib_path)
     intrinsics = projection[[0, 5, 2, 6]].astype(np.float64, copy=True)
 
     paths: Iterable[Path] = image_paths
@@ -207,16 +214,16 @@ def iter_images(
         if image is None:
             raise RuntimeError(f"failed to read image: {image_path}")
         src_height, src_width = image.shape[:2]
-        height, width, _ = target_size(args, src_height, src_width)
+        height, width, resolution_mode = target_size(args, src_height, src_width)
         scaled_intrinsics = intrinsics.copy()
-        if (src_height, src_width) != (height, width):
+        if resolution_mode == "native":
+            image = image[:height, :width]
+        elif (src_height, src_width) != (height, width):
             image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
             scaled_intrinsics[0] *= width / src_width
             scaled_intrinsics[2] *= width / src_width
             scaled_intrinsics[1] *= height / src_height
             scaled_intrinsics[3] *= height / src_height
-        else:
-            image = image[:height, :width]
         if show_progress and tqdm is None and (t + 1) % 100 == 0:
             print(f"{progress_label}: {t + 1}/{len(image_paths)} frame(s)")
         yield t, image, scaled_intrinsics.astype("float32"), height, width
@@ -441,6 +448,8 @@ def write_scene_csv(path: Path, scene_rows: list[dict[str, object]]) -> None:
         "trial_rotation_error_deg_per_m",
         "num_segments",
         "image_sizes",
+        "calibration_file",
+        "projection_key",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -485,6 +494,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         median_rotation = float(np.median(trial_rotation))
         mean_rotation = float(np.mean(trial_rotation))
+        calibration_file = args.kittidir / "dataset" / "sequences" / scene / "calib.txt"
+        projection_key, _ = select_projection(
+            read_calib_file(calibration_file),
+            args.image_folder,
+            calibration_file,
+        )
         scene_rows.append(
             {
                 "scene": scene,
@@ -499,11 +514,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "trial_rotation_error_deg_per_m": trial_rotation,
                 "num_segments": int(np.median(trial_segments)),
                 "image_sizes": sorted([f"{height}x{width}" for height, width in seen_sizes]),
+                "calibration_file": str(calibration_file),
+                "projection_key": projection_key,
             }
         )
 
-    avg_t = float(np.mean([row["median_translation_error_percent"] for row in scene_rows]))
-    avg_r = float(np.mean([row["median_rotation_error_deg_per_m"] for row in scene_rows]))
+    avg_t = float(np.mean([row["mean_translation_error_percent"] for row in scene_rows]))
+    avg_r = float(np.mean([row["mean_rotation_error_deg_per_m"] for row in scene_rows]))
+    avg_median_t = float(np.mean([row["median_translation_error_percent"] for row in scene_rows]))
+    avg_median_r = float(np.mean([row["median_rotation_error_deg_per_m"] for row in scene_rows]))
     payload = {
         "config": str(args.config),
         "network": str(args.network),
@@ -523,6 +542,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "avg_translation_error_percent": avg_t,
         "avg_rotation_error_deg_per_m": avg_r,
         "avg_rotation_error_deg_per_100m": 100.0 * avg_r,
+        "avg_median_translation_error_percent": avg_median_t,
+        "avg_median_rotation_error_deg_per_m": avg_median_r,
+        "avg_median_rotation_error_deg_per_100m": 100.0 * avg_median_r,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")

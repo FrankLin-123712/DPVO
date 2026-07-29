@@ -171,5 +171,7 @@ subset_0493/
 testdata/
 
 # tools
-tools/statistic_dpvo/statistic_result
+tools/statistic_dpvo/statistic_result*/
 tools/statistic_dpvo/tmp
+
+datasets/

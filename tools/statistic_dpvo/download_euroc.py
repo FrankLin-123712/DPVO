@@ -30,7 +30,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 try:
     from tqdm import tqdm
@@ -41,6 +41,7 @@ except ModuleNotFoundError:
 DPVO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EUROC_DIR = DPVO_ROOT / "datasets" / "EUROC"
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+EXTRACT_CHUNK_BYTES = 1024 * 1024
 FALLBACK_PROGRESS_BYTES = 256 * 1024 * 1024
 
 EUROC_SCENES = [
@@ -283,6 +284,109 @@ def download(url: str, destination: Path) -> None:
     raise last_error
 
 
+def safe_zip_destination(root: Path, resolved_root: Path, member_name: str) -> Path:
+    destination = root / member_name
+    try:
+        destination.resolve().relative_to(resolved_root)
+    except ValueError as exc:
+        raise RuntimeError(f"archive member escapes extraction root: {member_name}") from exc
+    return destination
+
+
+def extract_zip_member(
+    zipped: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    root: Path,
+    resolved_root: Path,
+    progress_update: Callable[[int], None],
+) -> int:
+    destination = safe_zip_destination(root, resolved_root, member.filename)
+    if member.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        return 0
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    extracted = 0
+    with zipped.open(member) as source, destination.open("wb") as output:
+        while True:
+            chunk = source.read(EXTRACT_CHUNK_BYTES)
+            if not chunk:
+                break
+            output.write(chunk)
+            extracted += len(chunk)
+            progress_update(len(chunk))
+    return extracted
+
+
+def extract_zip_with_text_progress(
+    zipped: zipfile.ZipFile,
+    members: Sequence[zipfile.ZipInfo],
+    destination: Path,
+    resolved_destination: Path,
+    total_bytes: int,
+    label: str,
+) -> None:
+    print(f"{label}: extracting")
+    extracted = 0
+    next_report = FALLBACK_PROGRESS_BYTES
+
+    def update(increment: int) -> None:
+        nonlocal extracted, next_report
+        extracted += increment
+        if extracted < next_report:
+            return
+        if total_bytes > 0:
+            percent = 100.0 * extracted / total_bytes
+            print(
+                f"{label}: extracted {extracted / (1024 * 1024):.1f} MiB / "
+                f"{total_bytes / (1024 * 1024):.1f} MiB ({percent:.1f}%)"
+            )
+        else:
+            print(f"{label}: extracted {extracted / (1024 * 1024):.1f} MiB")
+        next_report += FALLBACK_PROGRESS_BYTES
+
+    for member in members:
+        extract_zip_member(zipped, member, destination, resolved_destination, update)
+
+    print(f"{label}: extracted {extracted / (1024 * 1024):.1f} MiB")
+
+
+def extract_zip_with_progress(archive: Path, destination: Path, label: str) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    resolved_destination = destination.resolve()
+    with zipfile.ZipFile(archive) as zipped:
+        members = zipped.infolist()
+        total_bytes = sum(member.file_size for member in members if not member.is_dir())
+
+        if tqdm is None:
+            extract_zip_with_text_progress(
+                zipped,
+                members,
+                destination,
+                resolved_destination,
+                total_bytes,
+                label,
+            )
+            return
+
+        with tqdm(
+            total=total_bytes,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=label,
+            leave=True,
+        ) as progress:
+            for member in members:
+                extract_zip_member(
+                    zipped,
+                    member,
+                    destination,
+                    resolved_destination,
+                    progress.update,
+                )
+
+
 def remove_existing(path: Path, overwrite: bool) -> bool:
     if not path.exists():
         return True
@@ -301,8 +405,11 @@ def extract_nested_zips(root: Path) -> None:
         if nested_target.exists():
             continue
         nested_target.mkdir(parents=True)
-        with zipfile.ZipFile(nested_zip) as zipped:
-            zipped.extractall(nested_target)
+        extract_zip_with_progress(
+            nested_zip,
+            nested_target,
+            f"{nested_zip.name}: extracting",
+        )
 
 
 def find_sequence_dirs(root: Path, expected_scenes: Iterable[str]) -> dict[str, Path]:
@@ -346,8 +453,7 @@ def extract_sequence_archive(item: DownloadItem, archive: Path, eurocdir: Path, 
         shutil.rmtree(temporary)
     temporary.mkdir(parents=True)
     try:
-        with zipfile.ZipFile(archive) as zipped:
-            zipped.extractall(temporary)
+        extract_zip_with_progress(archive, temporary, f"{item.label}: extracting")
         extract_nested_zips(temporary)
         promote_sequence_dirs(temporary, eurocdir, item.scenes, overwrite)
     finally:
@@ -365,8 +471,7 @@ def extract_calibration_archive(archive: Path, eurocdir: Path, overwrite: bool) 
         shutil.rmtree(temporary)
     temporary.mkdir(parents=True)
     try:
-        with zipfile.ZipFile(archive) as zipped:
-            zipped.extractall(temporary)
+        extract_zip_with_progress(archive, temporary, "Calibration Datasets: extracting")
         if target.exists():
             shutil.rmtree(target)
         target.mkdir(parents=True)
