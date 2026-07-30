@@ -57,7 +57,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--backend-thresh", type=float, default=64.0)
+    parser.add_argument("--backend-thresh", "--backend_thresh", type=float, default=64.0)
     parser.add_argument("--scenes", nargs="+", choices=EUROC_SCENES, default=EUROC_SCENES)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--save-trajectory", action="store_true")

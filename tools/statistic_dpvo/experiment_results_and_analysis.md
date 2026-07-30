@@ -68,20 +68,20 @@ y-axis 有三個刻度軸，分別是 total ops(number of count), total mem(byte
 
 - EuRoC evaluation uses all 11 sequences, stride=2, trials=3, ATE is averaged from per-sequence median ATE.
 
-| Config | resolution | Total_Ops | Total_mem (bytes) | ATE(m)@EuRoC |
-| ---     | ---:      |   ---:   | ---:     |  ---:    | 
-| DFVO    |           |          |          |          |
-| DPDM    | 480x640   |          |          | 3.263949 |
-|`default`| 480x640   | 386.897G |  21.790G |    0.105 | 
-|`fast`   | 480x640   | 134.592G |   7.798G |    0.129 | 
-|`fast`   | 320x416   | 120.785G |   6.831G | 0.137672 | 
-|`fast`   | 240x320   | 116.318G |   6.519G | 0.302300 | 
-|`fast`   | 192x256   | 114.125G |   6.365G | 0.460346 | 
-|`knee`   | 480x640   |  66.771G |   3.998G | 0.254978 | 
-|`knee`   | 320x416   |  52.965G |   3.067G | 0.290327 | 
-|`knee`   | 240x320   |  48.498G |   2.765G | 0.363238 | 
-|`knee`   | 192x256   |  46.305G |   2.617G | 0.561292 | 
-
-
-- 0.182255 - knee with 64 patches per frame and 480x640 resolution.
-- 0.190128 - knee with 64 patches per frame and 320x416  resolution.
+| Config   | resolution | Total_Ops | Total_mem (bytes) | ATE(m)@EuRoC |
+| ---      | ---:      |   ---:   | ---:     |  ---:    | 
+| DFVO     |           |          |          |          |
+| DPDM     | 480x640   |          |          | 3.263949 |
+|`default` | 480x640   | 386.897G |  21.790G |    0.105 | 
+|`fast`    | 480x640   | 134.592G |   7.798G |    0.129 | 
+|`fast`    | 320x416   | 120.785G |   6.831G | 0.137672 | 
+|`fast`    | 240x320   | 116.318G |   6.519G | 0.302300 | 
+|`fast`    | 192x256   | 114.125G |   6.365G | 0.460346 | 
+|`fast_p16`| 480x640   |  61.167G |   3.750G | 0.293785 | 
+|`knee_p64`| 480x640   | 109.126G |   6.335G | 0.182255 |
+|`knee_p64`| 320x416   |  95.320G |   5.404G | 0.190128 | 
+|`knee`    | 480x640   |  66.771G |   3.998G | 0.254978 | 
+|`knee`    | 320x416   |  52.965G |   3.067G | 0.290327 | 
+|`knee`    | 240x320   |  48.498G |   2.765G | 0.363238 | 
+|`knee`    | 192x256   |  46.305G |   2.617G | 0.561292 | 
+|`knee_p16`| 480x640   |  45.593G |   2.829G | 0.365000 | 
