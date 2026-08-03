@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 
-from dpvo_runner_parity_common import build_sequence_data, tensor_to_numpy, write_case
+SCRIPT_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = SCRIPT_DIR.parent
+REPO_ROOT = TOOLS_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from dpvo_runner_parity_common import build_sequence_data, tensor_to_numpy, write_case  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,25 +26,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weights",
         type=Path,
-        default=Path("/home/chiehchihlin/DPVO/dpvo.pth"),
+        default=REPO_ROOT / "dpvo.pth",
         help="Path to the DPVO checkpoint.",
     )
     parser.add_argument(
         "--images",
         type=Path,
-        default=Path("/home/chiehchihlin/DPVO/subset_0493"),
+        default=REPO_ROOT / "subset_0493",
         help="Directory containing source image frames.",
     )
     parser.add_argument(
         "--calib",
         type=Path,
-        default=Path("/home/chiehchihlin/DPVO/calib/iphone.txt"),
+        default=REPO_ROOT / "calib" / "iphone.txt",
         help="Calibration text file used to scale intrinsics.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/home/chiehchihlin/DPVO/testdata/dpvo_runner_parity_small"),
+        default=REPO_ROOT / "testdata" / "dpvo_runner_parity_small",
         help="Root directory for generated component parity cases.",
     )
     parser.add_argument(

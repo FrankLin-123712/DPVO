@@ -14,7 +14,8 @@ from typing import Any
 import numpy as np
 
 
-TOOLS_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = SCRIPT_DIR.parent
 REPO_ROOT = TOOLS_DIR.parent
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")

@@ -14,17 +14,19 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-TOOLS_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = SCRIPT_DIR.parent
 REPO_ROOT = TOOLS_DIR.parent
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOLS_DIR))
+sys.path.insert(0, str(SCRIPT_DIR))
 
 from dpvo import projective_ops as pops  # noqa: E402
 from dpvo import fastba  # noqa: E402
 from dpvo.lietorch import SE3  # noqa: E402
-from export_models import (  # noqa: E402
+from export2onnx.export_models import (  # noqa: E402
     DIM,
     UpdateWrapperExplicitNeighbors,
     compute_neighbor_indices,

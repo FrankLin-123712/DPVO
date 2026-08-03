@@ -193,20 +193,19 @@ python evaluate_kitti.py --trials=5 --plot --save_trajectory
 
 ## Tools
 
-The scripts under `tools/` cover ONNX export, workload estimation, runtime parity data generation, and video frame extraction. Run the commands below from the repository root after activating the `dpvo` environment. Use `python tools/<script>.py --help` for the complete option list.
+The scripts under `tools/` cover ONNX export, workload estimation, runtime parity data generation, and video frame extraction. Run the commands below from the repository root after activating the `dpvo` environment. Use `python tools/<path-to-script>.py --help` for the complete option list.
 
 | Script | Purpose |
 | --- | --- |
-| `export2onnx.sh` | Export the feature encoder and update block with the standard defaults. |
-| `export_models.py` | Configurable ONNX exporter used by `export2onnx.sh`. |
-| `verify_onnxmodel.py` | Print ONNX metadata and run the ONNX structural checker. |
+| `export2onnx/export2onnx.sh` | Export the feature encoder and update block with the standard defaults. |
+| `export2onnx/export_models.py` | Configurable ONNX exporter used by `export2onnx/export2onnx.sh`. |
+| `export2onnx/verify_onnxmodel.py` | Print ONNX metadata and run the ONNX structural checker. |
 | `analyze_dpvo_workload.py` | Statically estimate module-level MACs, memory traffic, and operational intensity. |
-| `gen_testdata.sh` | Generate the predefined end-to-end and component parity datasets. |
-| `generate_dpvo_python_testdata.py` | Generate a resized input sequence and golden outputs from the Python DPVO tracker. |
-| `generate_dpvo_runner_parity_testdata.py` | Generate patchify, correlation, update, and bundle-adjustment parity cases. |
-| `generate_update_block_case.py` | Generate a small deterministic update-block parity case. |
+| `gen_testdata/gen_testdata.sh` | Generate the predefined end-to-end and component parity datasets. |
+| `gen_testdata/generate_dpvo_python_testdata.py` | Generate a resized input sequence and golden outputs from the Python DPVO tracker. |
+| `gen_testdata/generate_dpvo_runner_parity_testdata.py` | Generate patchify, correlation, update, and bundle-adjustment parity cases. |
 | `turn_mov2png.sh` | Convert every `.mov`/`.MOV` file in a directory to PNG frames. |
-| `dpvo_runner_parity_common.py` | Internal support module for the runner parity generator; it is not a standalone command. |
+| `gen_testdata/dpvo_runner_parity_common.py` | Internal support module for the runner parity generator; it is not a standalone command. |
 
 ### ONNX export and validation
 
@@ -215,23 +214,23 @@ The ONNX commands require the Python `onnx` package in addition to the installed
 Export both supported models:
 
 ```bash
-./tools/export2onnx.sh
+./tools/export2onnx/export2onnx.sh
 ```
 
-`export2onnx.sh` uses `$HOME/miniconda3/envs/dpvo/bin/python` when available and otherwise uses `python` from `PATH`. Its defaults can be overridden with environment variables:
+`export2onnx/export2onnx.sh` uses `$HOME/miniconda3/envs/dpvo/bin/python` when available and otherwise uses `python` from `PATH`. Its defaults can be overridden with environment variables:
 
 ```bash
 PYTHON_BIN=/path/to/python \
 WEIGHTS=./dpvo.pth \
 OUT_DIR=./exported_models \
 HEIGHT=480 WIDTH=640 EDGES=256 OPSET=13 \
-./tools/export2onnx.sh
+./tools/export2onnx/export2onnx.sh
 ```
 
 For finer control, invoke the exporter directly:
 
 ```bash
-python tools/export_models.py \
+python tools/export2onnx/export_models.py \
     --weights ./dpvo.pth \
     --out ./exported_models \
     --height 480 \
@@ -252,7 +251,7 @@ The update block accepts `net`, `ctx`, `corr`, `ii`, `jj`, `kk`, `ix`, and `jx`,
 Inspect either model and run `onnx.checker`:
 
 ```bash
-python tools/verify_onnxmodel.py exported_models/update_block.onnx
+python tools/export2onnx/verify_onnxmodel.py exported_models/update_block.onnx
 ```
 
 The default model, when the positional path is omitted, is `exported_models/update_block.onnx`.
@@ -296,7 +295,7 @@ Input frames are discovered in filename order and may be PNG or JPEG. Calibratio
 Generate all predefined datasets:
 
 ```bash
-./tools/gen_testdata.sh 0
+./tools/gen_testdata/gen_testdata.sh 0
 ```
 
 The mode selects which dataset to generate:
@@ -316,13 +315,13 @@ WEIGHTS=/path/to/dpvo.pth \
 IMAGES=/path/to/frames \
 CALIB=/path/to/calib.txt \
 TESTDATA_ROOT=/path/to/testdata \
-./tools/gen_testdata.sh 1
+./tools/gen_testdata/gen_testdata.sh 1
 ```
 
 To customize an end-to-end case directly:
 
 ```bash
-python tools/generate_dpvo_python_testdata.py \
+python tools/gen_testdata/generate_dpvo_python_testdata.py \
     --weights ./dpvo.pth \
     --images ./subset_0493 \
     --calib ./calib/iphone.txt \
@@ -338,7 +337,7 @@ At least eight frames are required. `--width` and `--height` may be supplied tog
 Generate the four component-level cases directly:
 
 ```bash
-python tools/generate_dpvo_runner_parity_testdata.py \
+python tools/gen_testdata/generate_dpvo_runner_parity_testdata.py \
     --weights ./dpvo.pth \
     --images ./subset_0493 \
     --calib ./calib/iphone.txt \
@@ -348,18 +347,7 @@ python tools/generate_dpvo_runner_parity_testdata.py \
     --patches-per-frame 8
 ```
 
-This creates `patchify_small/`, `correlation_small/`, `update_small/`, and `bundle_adjustment_small/`. Supply all path arguments when invoking this script directly; its built-in path defaults are machine-specific. Bundle-adjustment golden generation requires CUDA.
-
-For a small CPU-only update-block test vector that does not require source images:
-
-```bash
-python tools/generate_update_block_case.py \
-    --weights ./dpvo.pth \
-    --output /tmp/dpvo_update_block_case_small \
-    --seed 7 --groups 4 --edges-per-group 3
-```
-
-The output contains inputs, explicit `ix`/`jx` neighbor indices, golden `net`/`delta`/`weight` tensors, and `manifest.txt`. `--groups` must be positive and `--edges-per-group` must be at least 2.
+This creates `patchify_small/`, `correlation_small/`, `update_small/`, and `bundle_adjustment_small/`. Its defaults match the wrapper defaults for `dpvo.pth`, `subset_0493/`, `calib/iphone.txt`, and `testdata/dpvo_runner_parity_small/`. Bundle-adjustment golden generation requires CUDA.
 
 ### Convert MOV videos to PNG sequences
 

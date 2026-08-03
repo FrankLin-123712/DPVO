@@ -50,7 +50,7 @@ y-axis 有三個刻度軸，分別是 total ops(number of count), total mem(byte
 ![](./statistic_result/sweep_plots/removal_window_sweep.svg)
 
 ### Analysis
-- 從圖表可以看出對於資源開銷最有影響的就是 `PATCH_LIFETIME`, `PATCHES_PER_FRAME`, `REMOVAL_WINDOW`，透過 Visualization 可以得到一個 knee.yaml 的 algorithm parameters，但由於我們在實驗時，都是只動一個變數，，無法確定當多變數都往較少運算資源的配置改動時，是否會彼此互相影響到置 accuracy 大幅下降，我們嘗試去比較 fast.yaml(`480x640`) 與 knee.yaml(`320x416`) 之間的 ATE(m)。實驗之後可以得到 fast 配置的 ATE 為 0.137672(m)，而 knee 配置的 ATE 為 0.190128(m)，還是 fast 較佳。
+- 從圖表可以看出對於資源開銷最有影響的就是 `PATCH_LIFETIME`, `PATCHES_PER_FRAME`, `REMOVAL_WINDOW`，透過 Visualization 可以得到一個 knee.yaml 的 algorithm parameters，但由於我們在實驗時，都是只動一個變數，無法確定當多變數都往較少運算資源的配置改動時，是否會彼此互相影響到置 accuracy 大幅下降，我們嘗試去比較 fast.yaml(`480x640`) 與 knee.yaml(`320x416`) 之間的 ATE(m)。實驗之後可以得到 fast 配置的 ATE 為 0.137672(m)，而 knee 配置的 ATE 為 0.190128(m)，還是 fast 較佳。
 - 如果 feature point 數量變少的情況下，我是否能夠提高 BA_ITERATION 來補回精準度 ? NO, 從圖片就可以看多出，即使我增加 BA_ITERATION 的次數也沒辦法保證誤差會下降。
 ![](./statistic_result/fast_ba_iterations_2_to_20/sweep_plots/ba_iterations_sweep.svg)
 - 確認 default.yaml 配置下在 Kitti dataset 上的誤差是多少，並以DPDM的誤差值當做是我們可容許的誤差值上限。
