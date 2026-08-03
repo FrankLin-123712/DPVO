@@ -23,7 +23,7 @@ import torch
 from torch.onnx import register_custom_op_symbolic
 from torch.onnx import symbolic_helper as sym_help
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 sys.path.insert(0, str(REPO_ROOT))

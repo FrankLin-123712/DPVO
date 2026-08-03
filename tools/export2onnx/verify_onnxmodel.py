@@ -8,7 +8,7 @@ from pathlib import Path
 
 import onnx
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = REPO_ROOT / "exported_models" / "update_block.onnx"
 
 
