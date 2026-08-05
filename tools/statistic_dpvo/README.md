@@ -469,6 +469,17 @@ DPVO 產生 estimated trajectory 後，evaluator 會：
 - `mean_ate_m`：此 scene 的 trial mean。
 - `avg_ate_m`：所有 scenes 的 `median_ate_m` 再取平均。
 
+加上 `--plot` 時，每個 EuRoC sequence 會在 `--output` 所在的 `euroc_eval`
+資料夾產生一張彙整 trajectory plot：`<scene>_results.pdf`。每張圖包含
+ground-truth trajectory，以及所有 trials 的 estimated trajectories。
+
+加上 `--avg_plot` 或 `--avg-plot` 時，plot 只會顯示 ground-truth trajectory
+與所有 trials 對齊後的平均 estimated trajectory。`--avg_plot` 可以單獨使用，
+也可以和 `--plot` 一起使用。
+
+加上 `--save_trajectory` 或 `--save-trajectory` 時，每個 trial 的 estimated
+trajectory 會以 TUM format 存在 `euroc_eval/saved_trajectories/`。
+
 `sweep_dpvo.py` 最後放進 `sweep_summary.csv` 的 `ate_m` 就是 evaluator JSON 裡的
 `avg_ate_m`。
 
@@ -649,7 +660,10 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
   --height 480 \
   --width 640 \
   --stride 2 \
-  --trials 3
+  --trials 3 \
+  --plot \
+  --avg_plot \
+  --save_trajectory
 ```
 
 限制 scenes：

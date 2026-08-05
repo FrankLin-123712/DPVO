@@ -10,6 +10,7 @@ without editing dpvo/stream.py.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gc
 import glob
@@ -60,7 +61,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backend-thresh", "--backend_thresh", type=float, default=64.0)
     parser.add_argument("--scenes", nargs="+", choices=EUROC_SCENES, default=EUROC_SCENES)
     parser.add_argument("--plot", action="store_true")
-    parser.add_argument("--save-trajectory", action="store_true")
+    parser.add_argument(
+        "--avg-plot",
+        "--avg_plot",
+        action="store_true",
+        dest="avg_plot",
+        help="Plot only the average aligned trial trajectory plus ground truth.",
+    )
+    parser.add_argument(
+        "--save-trajectory",
+        "--save_trajectory",
+        action="store_true",
+        dest="save_trajectory",
+    )
     parser.add_argument("--opts", nargs="+", default=[])
     parser.add_argument(
         "--no-progress",
@@ -70,9 +83,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def require_runtime_dependencies() -> None:
+def require_runtime_dependencies(plot: bool = False) -> None:
     missing: list[str] = []
-    for module in ("cv2", "evo", "numpy", "torch"):
+    modules = ["cv2", "evo", "numpy", "torch"]
+    if plot:
+        modules.append("matplotlib")
+    for module in modules:
         try:
             __import__(module)
         except ModuleNotFoundError:
@@ -225,7 +241,11 @@ def run_sequence(
     return poses, __import__("numpy").array(timestamps, dtype="float64")
 
 
-def evaluate_scene(args: argparse.Namespace, scene: str, trial: int) -> float:
+def evaluate_scene(
+    args: argparse.Namespace,
+    scene: str,
+    trial: int,
+) -> tuple[float, "PoseTrajectory3D", "PoseTrajectory3D"]:
     import numpy as np
     import torch
     import evo.main_ape as main_ape
@@ -275,20 +295,6 @@ def evaluate_scene(args: argparse.Namespace, scene: str, trial: int) -> float:
         )
         ate_score = float(result.stats["rmse"])
 
-        if args.plot:
-            from dpvo.plot_utils import plot_trajectory
-
-            output_dir = args.output.parent / "trajectory_plots"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            plot_trajectory(
-                traj_est_evo,
-                traj_ref,
-                f"EuRoC {scene} Trial #{trial + 1} (ATE: {ate_score:.03f})",
-                str(output_dir / f"Euroc_{scene}_Trial{trial + 1:02d}.pdf"),
-                align=True,
-                correct_scale=True,
-            )
-
         if args.save_trajectory:
             output_dir = args.output.parent / "saved_trajectories"
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -296,9 +302,128 @@ def evaluate_scene(args: argparse.Namespace, scene: str, trial: int) -> float:
                 str(output_dir / f"Euroc_{scene}_Trial{trial + 1:02d}.txt"),
                 traj_est_evo,
             )
-        return ate_score
+        return ate_score, traj_ref, traj_est_evo
     finally:
         release_cuda_cache()
+
+
+def plot_scene_trajectories(
+    scene: str,
+    traj_ref: "PoseTrajectory3D",
+    trial_results: Sequence[
+        tuple[int, float, "PoseTrajectory3D", "PoseTrajectory3D"]
+    ],
+    filename: Path,
+    avg_plot: bool = False,
+) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from evo.core.trajectory import PoseTrajectory3D
+    from evo.tools import plot
+
+    aligned_results = []
+    for trial, ate_score, trial_traj_ref, traj_est in trial_results:
+        traj_ref_sync = copy.deepcopy(trial_traj_ref)
+        traj_est_sync = copy.deepcopy(traj_est)
+        traj_est_sync.align(traj_ref_sync, correct_scale=True)
+        aligned_results.append((trial, ate_score, traj_ref_sync, traj_est_sync))
+
+    plot_collection = plot.PlotCollection("PlotCol")
+    fig = plt.figure(figsize=(8, 8))
+    plot_mode = plot.PlotMode.xz
+    ax = plot.prepare_axis(fig, plot_mode)
+    ax.set_title(f"EuRoC {scene} Results")
+
+    if avg_plot:
+        timestamp_sets = [
+            {float(timestamp) for timestamp in traj_est_sync.timestamps}
+            for _, _, _, traj_est_sync in aligned_results
+        ]
+        common_timestamps = sorted(set.intersection(*timestamp_sets))
+        if not common_timestamps:
+            raise RuntimeError(f"no common timestamps available to average {scene} trials")
+
+        position_maps = []
+        for _, _, traj_ref_sync, traj_est_sync in aligned_results:
+            position_maps.append(
+                {
+                    float(timestamp): position
+                    for timestamp, position in zip(
+                        traj_est_sync.timestamps,
+                        traj_est_sync.positions_xyz,
+                    )
+                }
+            )
+        first_ref = aligned_results[0][2]
+        first_est = aligned_results[0][3]
+        reference_by_time = {
+            float(timestamp): position
+            for timestamp, position in zip(first_est.timestamps, first_ref.positions_xyz)
+        }
+        average_positions = np.array(
+            [
+                np.mean([position_map[timestamp] for position_map in position_maps], axis=0)
+                for timestamp in common_timestamps
+            ],
+            dtype=np.float64,
+        )
+        reference_positions = np.array(
+            [reference_by_time[timestamp] for timestamp in common_timestamps],
+            dtype=np.float64,
+        )
+        timestamps = np.array(common_timestamps, dtype=np.float64)
+        orientations = np.zeros((len(common_timestamps), 4), dtype=np.float64)
+        orientations[:, 0] = 1.0
+        average_traj = PoseTrajectory3D(
+            positions_xyz=average_positions,
+            orientations_quat_wxyz=orientations,
+            timestamps=timestamps,
+        )
+        reference_traj = PoseTrajectory3D(
+            positions_xyz=reference_positions,
+            orientations_quat_wxyz=orientations.copy(),
+            timestamps=timestamps,
+        )
+        mean_ate = float(np.mean([ate_score for _, ate_score, _, _ in aligned_results]))
+        plot.traj(ax, plot_mode, reference_traj, "--", "gray", "Ground Truth")
+        plot.traj(
+            ax,
+            plot_mode,
+            average_traj,
+            "-",
+            "tab:blue",
+            f"Average ({len(aligned_results)} trials, mean ATE: {mean_ate:.3f})",
+        )
+    else:
+        plot.traj(ax, plot_mode, traj_ref, "--", "gray", "Ground Truth")
+        colors = [
+            "tab:blue",
+            "tab:orange",
+            "tab:green",
+            "tab:red",
+            "tab:purple",
+            "tab:brown",
+            "tab:pink",
+            "tab:olive",
+            "tab:cyan",
+        ]
+        for color_index, (trial, ate_score, _, traj_est_sync) in enumerate(aligned_results):
+            plot.traj(
+                ax,
+                plot_mode,
+                traj_est_sync,
+                "-",
+                colors[color_index % len(colors)],
+                f"Trial {trial + 1} (ATE: {ate_score:.3f})",
+            )
+
+    ax.legend()
+    fig.tight_layout()
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    plot_collection.add_figure("traj (error)", fig)
+    plot_collection.export(str(filename), confirm_overwrite=False)
+    plt.close(fig=fig)
+    print(f"Saved {filename}")
 
 
 def write_scene_csv(path: Path, scene_rows: list[dict[str, object]]) -> None:
@@ -312,8 +437,9 @@ def write_scene_csv(path: Path, scene_rows: list[dict[str, object]]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    should_plot = args.plot or args.avg_plot
     try:
-        require_runtime_dependencies()
+        require_runtime_dependencies(plot=should_plot)
         validate_args(args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -324,6 +450,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     scene_rows: list[dict[str, object]] = []
     for scene_index, scene in enumerate(args.scenes, start=1):
         trial_scores = []
+        trial_trajectories = []
+        reference_trajectory = None
         for trial in range(args.trials):
             print(
                 f"candidate={args.config.stem} "
@@ -331,9 +459,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"trial={trial + 1}/{args.trials}",
                 flush=True,
             )
-            ate_score = evaluate_scene(args, scene, trial)
+            ate_score, traj_ref, traj_est = evaluate_scene(args, scene, trial)
             trial_scores.append(ate_score)
+            if should_plot:
+                if reference_trajectory is None:
+                    reference_trajectory = traj_ref
+                trial_trajectories.append((trial, ate_score, traj_ref, traj_est))
             print(f"{scene} trial {trial + 1}: {ate_score:.6f}")
+        if should_plot and reference_trajectory is not None:
+            plot_scene_trajectories(
+                scene,
+                reference_trajectory,
+                trial_trajectories,
+                args.output.parent / f"{scene}_results.pdf",
+                avg_plot=args.avg_plot,
+            )
         scene_rows.append(
             {
                 "scene": scene,
