@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-long-edge", type=int, default=256)
     parser.add_argument("--width", type=int, default=0)
     parser.add_argument("--height", type=int, default=0)
+    parser.add_argument(
+        "--config-yaml",
+        type=Path,
+        default=None,
+        help="Optional dpvo_runner config YAML; tracker shape fields override CLI defaults.",
+    )
     parser.add_argument("--patches-per-frame", type=int, default=32)
     parser.add_argument("--buffer-size", type=int, default=64)
     parser.add_argument("--removal-window", type=int, default=12)
@@ -64,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-damping", type=float, default=0.5)
     parser.add_argument("--centroid-sel-strat", choices=["RANDOM", "GRADIENT_BIAS"], default="RANDOM")
     parser.add_argument("--mixed-precision", action="store_true")
+    parser.add_argument("--ba-iterations", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--cuda-device", type=int, default=0)
     parser.add_argument(
@@ -85,6 +92,84 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def strip_inline_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, ch in enumerate(line):
+        if ch == "\\" and in_double and not escaped:
+            escaped = True
+            continue
+        if ch == '"' and not in_single and not escaped:
+            in_double = not in_double
+        elif ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == "#" and not in_single and not in_double:
+            return line[:idx]
+        escaped = False
+    return line
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def parse_bool(value: str) -> bool:
+    token = unquote(value).strip().upper()
+    if token in {"TRUE", "YES", "ON", "1"}:
+        return True
+    if token in {"FALSE", "NO", "OFF", "0"}:
+        return False
+    raise ValueError(f"Invalid boolean value in config YAML: {value}")
+
+
+def apply_config_yaml(args: argparse.Namespace) -> None:
+    if args.config_yaml is None:
+        return
+    key_to_attr = {
+        "BUFFER_SIZE": ("buffer_size", int),
+        "PATCHES_PER_FRAME": ("patches_per_frame", int),
+        "REMOVAL_WINDOW": ("removal_window", int),
+        "OPTIMIZATION_WINDOW": ("optimization_window", int),
+        "PATCH_LIFETIME": ("patch_lifetime", int),
+        "KEYFRAME_INDEX": ("keyframe_index", int),
+        "KEYFRAME_THRESH": ("keyframe_thresh", float),
+        "MOTION_DAMPING": ("motion_damping", float),
+        "BA_ITERATIONS": ("ba_iterations", int),
+        "MIXED_PRECISION": ("mixed_precision", parse_bool),
+    }
+    for line_number, raw_line in enumerate(args.config_yaml.read_text(encoding="utf-8").splitlines(), 1):
+        line = strip_inline_comment(raw_line).strip()
+        if not line or line in {"---", "..."}:
+            continue
+        if ":" not in line:
+            raise ValueError(f"{args.config_yaml}:{line_number}: expected KEY: value")
+        key, value = line.split(":", 1)
+        key = key.strip().replace("-", "_").upper()
+        value = value.strip()
+        if key == "MOTION_MODEL":
+            args.motion_model = unquote(value)
+        elif key == "CENTROID_SEL_STRAT":
+            strategy = unquote(value).upper()
+            if strategy == "RANDOM":
+                args.centroid_sel_strat = "RANDOM"
+            elif strategy in {"GRADIENT", "GRADIENT_BIAS", "GRADIENT_BIASED"}:
+                args.centroid_sel_strat = "GRADIENT_BIAS"
+            else:
+                raise ValueError(f"{args.config_yaml}:{line_number}: unsupported CENTROID_SEL_STRAT={value}")
+        elif key in key_to_attr:
+            attr, parser = key_to_attr[key]
+            setattr(args, attr, parser(value))
+        elif key in {"LOOP_CLOSURE"}:
+            if parse_bool(value):
+                raise ValueError(f"{args.config_yaml}:{line_number}: BA benchmark expects LOOP_CLOSURE false")
+        else:
+            raise ValueError(f"{args.config_yaml}:{line_number}: unknown DPVO config key {key}")
 
 
 def tensor_to_numpy(tensor: Any, dtype: np.dtype) -> np.ndarray:
@@ -116,6 +201,7 @@ def make_ba_case_tensors(
     poses_after: Any,
     patches_after: Any,
     ba_call_index: int,
+    dpvo_frame_index: int,
     is_global: bool,
 ) -> OrderedDict[str, np.ndarray]:
     import torch
@@ -179,6 +265,7 @@ def make_ba_case_tensors(
             ("patches_per_frame", scalar_i64(patches_per_frame)),
             ("ba_t1", scalar_i64(t1)),
             ("ba_call_index", scalar_i64(ba_call_index)),
+            ("dpvo_frame_index", scalar_i64(dpvo_frame_index)),
             ("is_global", scalar_i64(1 if is_global else 0)),
             ("golden_poses", tensor_to_numpy(poses_after_flat, np.float32)),
             ("golden_patches", tensor_to_numpy(patches_after_flat, np.float32)),
@@ -198,6 +285,7 @@ def prepare_output_root(output_root: Path, overwrite: bool) -> Path:
 
 def main() -> int:
     args = parse_args()
+    apply_config_yaml(args)
     configure_determinism(args.seed)
 
     import torch
@@ -211,6 +299,7 @@ def main() -> int:
     image_paths = collect_image_paths(args.images, args.frame_start, args.frame_count, args.frame_step)
     source_intrinsics, distortion = load_calibration(args.calib)
     tracker_cfg = build_tracker_config(args)
+    tracker_cfg.BA_ITERATIONS = int(args.ba_iterations)
     image_dir = prepare_output_root(args.output_root, args.overwrite)
     frames, frame_names, intrinsics, src_width, src_height, dst_width, dst_height = preprocess_frames(
         image_paths=image_paths,
@@ -226,6 +315,7 @@ def main() -> int:
     original_fastba_ba = dpvo_module.fastba.BA
     captured_cases: list[tuple[int, OrderedDict[str, np.ndarray]]] = []
     eligible_ba_index = 0
+    current_frame_index = -1
 
     def recording_fastba_ba(
         poses,
@@ -294,6 +384,7 @@ def main() -> int:
                 poses_after=poses,
                 patches_after=patches,
                 ba_call_index=current_index,
+                dpvo_frame_index=current_frame_index,
                 is_global=is_global,
             )
             if args.all_cases:
@@ -310,10 +401,12 @@ def main() -> int:
     try:
         with torch.no_grad():
             for tstamp, frame in enumerate(frames):
+                current_frame_index = int(tstamp)
                 image_tensor = torch.from_numpy(frame).permute(2, 0, 1).cuda(non_blocking=False)
                 intrinsics_tensor = torch.from_numpy(intrinsics.copy()).cuda(non_blocking=False)
                 slam(tstamp, image_tensor, intrinsics_tensor)
             if args.include_terminate_updates:
+                current_frame_index = -1
                 slam.terminate()
     finally:
         dpvo_module.fastba.BA = original_fastba_ba
@@ -333,6 +426,7 @@ def main() -> int:
             {
                 "case_dir": str(case_dir),
                 "eligible_ba_index": int(ba_index),
+                "dpvo_frame_index": int(tensors["dpvo_frame_index"][0]),
                 "edges": int(tensors["ii"].shape[0]),
                 "poses": int(tensors["poses"].shape[0]),
                 "patches": int(tensors["patches"].shape[0]),
@@ -382,7 +476,7 @@ def main() -> int:
     for record in case_records:
         print(
             "case={case_dir} ba_index={eligible_ba_index} edges={edges} "
-            "poses={poses} patches={patches} fixed={fixed_pose_count} "
+            "frame={dpvo_frame_index} poses={poses} patches={patches} fixed={fixed_pose_count} "
             "iterations={iterations} global={is_global}".format(**record)
         )
     return 0
