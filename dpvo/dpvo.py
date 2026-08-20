@@ -109,6 +109,10 @@ class DPVO:
         self.P = self.network.P
 
         self.network.cuda()
+        if getattr(self.cfg, "NN_FP16_WEIGHTS", False):
+            if not self.cfg.MIXED_PRECISION:
+                raise ValueError("NN_FP16_WEIGHTS requires MIXED_PRECISION=True")
+            self.network.half()
         self.network.eval()
 
     def start_viewer(self):

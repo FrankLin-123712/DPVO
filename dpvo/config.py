@@ -25,6 +25,10 @@ _C.MOTION_DAMPING = 0.5
 
 _C.MIXED_PRECISION = True
 
+# Store neural-network weights in FP16 for inference. This is separate from
+# MIXED_PRECISION: autocast can run FP16 kernels while keeping FP32 weights.
+_C.NN_FP16_WEIGHTS = False
+
 # Loop closure
 _C.LOOP_CLOSURE = False
 _C.BACKEND_THRESH = 64.0

@@ -16,5 +16,7 @@ MOTION_DAMPING: 0.5
 
 # maybe use mixed precision for inference
 MIXED_PRECISION: True
+# store neural-network weights in FP16; BA state remains FP32 in dpvo.py
+NN_FP16_WEIGHTS: False
 
 CENTROID_SEL_STRAT: 'RANDOM'

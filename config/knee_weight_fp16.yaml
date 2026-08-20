@@ -1,10 +1,10 @@
 ### DPVO Config File ###
 
 # VO config (increase for better accuracy)
-PATCHES_PER_FRAME: 48
-REMOVAL_WINDOW: 16
-OPTIMIZATION_WINDOW: 7
-PATCH_LIFETIME: 11
+PATCHES_PER_FRAME: 32
+REMOVAL_WINDOW: 14
+OPTIMIZATION_WINDOW: 6 
+PATCH_LIFETIME: 7
 BA_ITERATIONS: 2
 
 # threshold for keyframe removal
@@ -17,7 +17,6 @@ MOTION_DAMPING: 0.5
 # maybe use mixed precision for inference
 MIXED_PRECISION: True
 # store neural-network weights in FP16; BA state remains FP32 in dpvo.py
-NN_FP16_WEIGHTS: False
+NN_FP16_WEIGHTS: True
 
 CENTROID_SEL_STRAT: 'RANDOM'
-
