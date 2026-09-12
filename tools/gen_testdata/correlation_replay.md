@@ -91,8 +91,8 @@ slots 放回原始位置，其餘保持空 Tensor，再傳入原始 `kk/jj/coord
 Python 預設 pmem=mem=36，但格式分別記錄兩者。
 輸出 flatten 順序為 `[xoff, yoff, py, px, level]`，各軸大小 `[7,7,3,3,2]`。
 第二層使用 `coords / 4`。重播不需要 poses、intrinsics、geometry patches 或
-reproject。這是新的 slots replay 格式，**目前的 C++ `correlation_parity`
-不能直接讀取**；後續需新增 reader／benchmark。
+reproject。此 slots replay 格式由 C++ `run_correlation` 讀取；舊的
+`correlation_parity` 不適用。下方提供 host／Spike／FireSim 操作流程。
 
 case metadata 的 `stage` 為 `motion_probe`、`initialization`、`update` 或
 `terminate`。初始化 12 次 update 以「該影像開始前尚未 initialized」辨識，
@@ -114,11 +114,104 @@ python -m unittest discover -s tools/gen_testdata -p 'test_correlation_replay_te
 設定。它們使用 host tensor adapter，沒有測試真實 PyTorch／CUDA inference。
 
 GPU 產生資料成功後，根目錄 `metadata.json` 必須是 `status: complete`；
-`captured_case_count` 應等於 `cases.txt` 行數。每個 case 都要求輸入／输出
+`captured_case_count` 應等於 `cases.txt` 行數。每個 case 都要求輸入／輸出
 dtype 正確、shape 正確、浮點值有限。失敗時根 metadata 會標記 `failed`，
 保留已完成的 cases；強制終止可能留下 `incomplete`，不能當完整資料集使用。
 請回傳終端輸出及根目錄 `metadata.json`，先核對階段、edge 數與資料規模。
 
-數值正確性仍需後續 C++ replay 驗證。Python CUDA 先 dot product 再插值，
-C++ 先插值再 dot product；比較時使用合理 atol/rtol 並報告誤差，不能期待
-bitwise 相同。產生器不量測 Python 或 C++ 的 correlation cycles。
+數值正確性仍需後續 C++ replay 驗證。目前 C++ 與 Python CUDA 都先對中心 floor 周圍
+8×8 整數位置計算 dot products，再插值為 7×7 scalar correlation；舊 C++ 版本則先插值 feature。
+累加精度與浮點順序仍可能不同，維持 C++ replay 的 atol=5e-4、rtol=1e-4，不要求 bitwise 相同。
+資料格式與 golden 不變，既有 replay 可直接使用。產生器不量測 Python 或 C++ 的 correlation cycles。
+
+## 資料產生器完整參數
+
+在 DPVO repository 根目錄執行 `python tools/gen_testdata/generate_correlation_replay_testdata.py --help`。
+路徑預設相對於 DPVO repository，而不是目前 shell 目錄；output-root 若明確
+指定相對路徑，則相對於目前 shell 目錄。
+
+| 參數 | 預設與用途 |
+|---|---|
+| `--weights PATH` | DPVO/dpvo.pth，請指定實際 checkpoint |
+| `--images DIR` | DPVO/datasets/EUROC/MH_01_easy/mav0/cam0/data |
+| `--calib PATH` | DPVO/calib/euroc.txt |
+| `--output-root DIR` | DPVO/testdata/correlation_replay_euroc_mh01_first16_p16，必須不存在或為空 |
+| `--config-yaml PATH` | 選用 C++ runner config；對應 tracker 參數優先於 CLI |
+| `--frame-start N` | 1，按檔名排序後的 1-based 起始影像 |
+| `--frame-count N` | 16，至少 8 張 |
+| `--frame-step N` | 1，每 N 張取一張 |
+| `--max-long-edge N` | 752，未指定寬高時限制最長邊，不放大 |
+| `--width N --height N` | 兩者一起指定；預設 0 自動，輸出尺寸向下對齊 16 倍數 |
+| `--undistort` / `--no-undistort` | 預設不去畸變；啟用時使用校正檔的 distortion |
+| `--patches-per-frame N` | 16，每張 patches 數 |
+| `--buffer-size N` | 64，實際至少 frame_count+8 |
+| `--removal-window N` | 16 |
+| `--optimization-window N` | 7 |
+| `--patch-lifetime N` | 11 |
+| `--keyframe-index N` | 4 |
+| `--keyframe-thresh F` | 15.0 |
+| `--motion-model NAME` | DAMPED_LINEAR |
+| `--motion-damping F` | 0.5 |
+| `--centroid-sel-strat NAME` | RANDOM，可選 GRADIENT_BIAS |
+| `--ba-iterations N` | 2 |
+| `--no-mixed-precision` | 明確標記 FP32；不論有無旗標，最後皆強制 FP32 |
+| `--seed N` | 7，設定 torch、NumPy、Python random |
+| `--cuda-device N` | 0，CUDA device index |
+| `--skip-terminate-updates` | 預設不啟用；指定後省略最後 terminate updates |
+| `--help` | 顯示說明 |
+
+沒有 `--overwrite`；若要重新產生資料，請用新的 output-root。也沒有
+`--all-cases`，因為此工具預設就保存所有 correlation 呼叫。
+
+## 在 C++ runner 使用產生的資料
+
+以下在有 Chipyard toolchain 的機器執行；Python 資料產生才需要 GPU。
+將完整資料目錄複製到該機器，再設定路徑：
+
+```bash
+DPVO_RUNNER=/home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner
+CORR_CASES=/home/cclin/DPVO/testdata/correlation_replay_euroc_mh01_first16_p16
+cd "$DPVO_RUNNER"
+./build.sh --config=Release --parallel --correlation-benchmark --host --host-tests -O2
+python3 tools/test_correlation_replay.py --binary build/host/Release/run_correlation
+python3 tools/test_correlation_scripts.py
+./build.sh --config=Release --parallel --correlation-benchmark -O2
+./run_corr_spike.sh --case_root "$CORR_CASES" --max_cases 1 -x 0 \
+  --profile_mode total --cache_policy warm --warmup 1 --repeat 1
+```
+
+建置用 `--correlation-benchmark` 選目標，再自行組合旗標：`--host` 改用
+x86 native compiler；`--for_firesim` 僅加入 FOR_FIRESIM definition；兩者皆不加
+時預設編譯 RISC-V rv64，可交給 Spike。`--parallel` 啟用平行編譯。
+最佳化須明確指定 -O0／-O2／-O3，Release 不自動設定 O2。
+
+RISC-V 輸出為 `build/Release/run_correlation`，host 為
+`build/host/Release/run_correlation`。預設 config 是 Debug；上例明確選 Release。
+`--host-tests` 執行 host core tests；replay 和腳本測試使用上述 Python 命令。
+
+Gemmini Spike 測試需明確指定 matching FP32 extension：
+
+```bash
+./run_corr_spike.sh --case_dir "$CORR_CASES/case_0000" -x 2 \
+  --gemmini-lib /path/to/matching-fp32/libgemmini.so \
+  --profile_mode phases --cache_policy warm --warmup 1 --repeat 1
+```
+
+工具位置可用 `--spike`、`--pk`，binary 用 `--binary`；`--dry-run` 顯示
+命令但不執行。CPU 模式不用 extension。DIM、BANK_ROWS、ACC_ROWS 必須
+與 binary／bitstream／extension 對齊，不要假設固定 DIM8 或 DIM16。
+
+FireSim binary 用 `./build.sh --config=Release --parallel --correlation-benchmark --for_firesim -O2` 建置，再由原本
+FireMarshal／FireSim 流程打包及執行。`total` 僅量外層，`phases` 有七段
+計時，其中新演算法使用 `integer_gather_pack`、`dot_product`、`interpolate_output` 區分
+整數 feature 搬移、點積與 scalar 插值；使用相同 case/execution/cache/warmup/repeat，
+分開執行比較 total 差異，差異亦可能包含執行波動。
+
+預設 warmup=1，**每個 repeat 前都重新暖機**，同一 case 的列印與 CSV
+輸出延後至所有 repeats 完成。CSV 記錄 profile_mode、cache_policy、
+warmup_per_repeat。warm 模式不宣稱所有資料都留在 cache；要不額外準備，
+用 `--cache_policy natural --warmup 0`，這也不是 cold-cache。
+
+完整 C++ 參數、FireSim 範例、CSV 格式與計時解讀見
+`dpvo_runner/docs/correlation_replay.md`。Spike cycles 只做功能檢查，
+性能結論應以 matching FireSim 硬體量測為準。
