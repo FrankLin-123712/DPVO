@@ -65,10 +65,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-terminate-updates", action="store_true", help="Omit final updates; included by default.")
     args = parser.parse_args(argv)
     args.mixed_precision = False
+    args.nn_fp16_weights = False
     apply_config_yaml(args)
     if args.mixed_precision:
         print("Overriding YAML MIXED_PRECISION=True: correlation replay captures use FP32.")
     args.mixed_precision = False
+    if args.nn_fp16_weights:
+        print("Overriding YAML NN_FP16_WEIGHTS=True: correlation replay captures use FP32 weights.")
+    args.nn_fp16_weights = False
     for name in ("frame_start", "frame_count", "frame_step", "patches_per_frame", "buffer_size",
                  "removal_window", "optimization_window", "patch_lifetime", "ba_iterations"):
         if getattr(args, name) <= 0:

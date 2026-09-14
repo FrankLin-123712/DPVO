@@ -13,11 +13,11 @@
 
 ```bash
 cd /home/cclin/DPVO
-python tools/gen_testdata/generate_correlation_replay_testdata.py \
-  --weights /path/to/dpvo.pth \
-  --images /home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/datasets/EUROC/MH_01_easy/mav0/cam0/data \
-  --calib /home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/calib/euroc.txt \
-  --config-yaml /home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/config/fast_p16.yaml \
+python3 tools/gen_testdata/generate_correlation_replay_testdata.py \
+  --weights dpvo.pth \
+  --images datasets/EUROC/MH_01_easy/mav0/cam0/data \
+  --calib calib/euroc.txt \
+  --config-yaml config/fast_p16.yaml \
   --frame-start 1 --frame-count 16 --frame-step 1 \
   --width 752 --height 480 \
   --no-undistort --no-mixed-precision --seed 7 \

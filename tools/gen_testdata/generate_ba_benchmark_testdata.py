@@ -148,6 +148,7 @@ def apply_config_yaml(args: argparse.Namespace) -> None:
         "MOTION_DAMPING": ("motion_damping", float),
         "BA_ITERATIONS": ("ba_iterations", int),
         "MIXED_PRECISION": ("mixed_precision", parse_bool),
+        "NN_FP16_WEIGHTS": ("nn_fp16_weights", parse_bool),
     }
     for line_number, raw_line in enumerate(args.config_yaml.read_text(encoding="utf-8").splitlines(), 1):
         line = strip_inline_comment(raw_line).strip()
