@@ -10,6 +10,8 @@ import numpy as np
 from generate_correlation_replay_testdata import (
     CorrelationRecorder, ReplayWriter, capture_inputs, is_feature, parse_args,
 )
+from generate_ba_benchmark_testdata import apply_config_yaml
+from generate_dpvo_python_testdata import build_tracker_config
 
 
 class HostTensor:
@@ -158,9 +160,35 @@ class ReplayTests(unittest.TestCase):
             config.write_text("MIXED_PRECISION: True\nPATCHES_PER_FRAME: 32\nLOOP_CLOSURE: false\n")
             args = parse_args(["--config-yaml", str(config), "--no-mixed-precision"])
             self.assertFalse(args.mixed_precision)
+            self.assertFalse(args.nn_fp16_weights)
             self.assertEqual(args.patches_per_frame, 32)
             self.assertTrue(args.no_undistort)
             self.assertFalse(args.skip_terminate_updates)
+
+    def test_yaml_weight_precision_is_parsed_but_replay_enforces_fp32(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.yaml"
+            for mixed in (False, True):
+                for half_weights in (False, True):
+                    with self.subTest(mixed=mixed, half_weights=half_weights):
+                        config.write_text(
+                            f"MIXED_PRECISION: {mixed}\nNN_FP16_WEIGHTS: {half_weights}\n")
+                        args = parse_args(["--config-yaml", str(config)])
+                        cfg = build_tracker_config(args)
+                        self.assertFalse(cfg.MIXED_PRECISION)
+                        self.assertFalse(cfg.NN_FP16_WEIGHTS)
+                        # Shared YAML parsing must preserve the requested value
+                        # for other generators; only correlation overrides it.
+                        apply_config_yaml(args)
+                        self.assertEqual(build_tracker_config(args).NN_FP16_WEIGHTS,
+                                         half_weights)
+
+    def test_yaml_rejects_invalid_weight_precision_boolean(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.yaml"
+            config.write_text("NN_FP16_WEIGHTS: invalid\n")
+            with self.assertRaisesRegex(ValueError, "Invalid boolean"):
+                parse_args(["--config-yaml", str(config)])
 
 
 if __name__ == "__main__":

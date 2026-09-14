@@ -43,6 +43,7 @@ class TrackerConfig:
     CLASSIC_LOOP_CLOSURE: bool
     LOOP_CLOSE_WINDOW_SIZE: int
     LOOP_RETR_THRESH: float
+    NN_FP16_WEIGHTS: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -303,6 +304,7 @@ def build_tracker_config(args: argparse.Namespace) -> TrackerConfig:
         MOTION_DAMPING=args.motion_damping,
         BA_ITERATIONS=2,
         MIXED_PRECISION=args.mixed_precision,
+        NN_FP16_WEIGHTS=getattr(args, "nn_fp16_weights", False),
         LOOP_CLOSURE=False,
         BACKEND_THRESH=64.0,
         MAX_EDGE_AGE=1000,
