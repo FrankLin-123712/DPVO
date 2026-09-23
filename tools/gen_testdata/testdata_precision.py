@@ -28,7 +28,11 @@ def prepare_reference(args):
         if previous_precision != args.nn_precision:
             raise ValueError("Output directory belongs to a different NN precision; use a separate directory")
     elif args.nn_precision == "fp16" and root.exists() and any(root.iterdir()):
-        raise ValueError("Refusing to overwrite nonempty output without precision metadata")
+        raise ValueError(
+            f"Refusing to overwrite nonempty output without precision metadata: {root.resolve()}. "
+            "metadata.json is missing (a previous generation may have been interrupted). "
+            "Use a new output directory or move the existing directory aside before retrying."
+        )
     if args.nn_precision == "fp32":
         return None
     from fp16_onnx_reference import MixedReference

@@ -28,6 +28,29 @@ def _float_operands(*values):
     return [None if v is None else v.astype(np.float32) for v in values]
 
 
+class GatherElements(OpRun):
+    op_domain = ""
+
+    def _run(self, data, indices, axis=0):
+        # ONNX's np.choose implementation hits NumPy's 32-choice limit on
+        # tracker-sized tensors. Direct indexing has no such axis-size limit.
+        if data.ndim < 1 or indices.ndim != data.ndim:
+            raise ValueError("GatherElements requires matching ranks >= 1")
+        if not -data.ndim <= axis < data.ndim:
+            raise ValueError("GatherElements axis out of range")
+        if indices.dtype not in (np.int32, np.int64):
+            raise TypeError("GatherElements indices must be int32 or int64")
+        axis %= data.ndim
+        if any(indices.shape[d] > data.shape[d] for d in range(data.ndim) if d != axis):
+            raise ValueError("GatherElements non-axis dimensions exceed data shape")
+        # Non-axis coordinates cover only the extent requested by indices.
+        # Slicing prevents take_along_axis from broadcasting those dimensions.
+        slices = tuple(slice(None) if d == axis else slice(indices.shape[d])
+                       for d in range(data.ndim))
+        # NumPy accepts valid negative indices and rejects out-of-bounds ones.
+        return (np.take_along_axis(data[slices], indices, axis=axis),)
+
+
 class MatMul(OpRun):
     op_domain = ""
 
@@ -174,7 +197,7 @@ class MixedGraph:
                 continue
             raise NotImplementedError(f"Unsupported reference node: {node.domain}::{node.op_type}")
         self.evaluator = ReferenceEvaluator(
-            self.model, new_ops=[Conv, MatMul, Gemm, scatter_sum, scatter_max], optimized=False)
+            self.model, new_ops=[Conv, MatMul, Gemm, GatherElements, scatter_sum, scatter_max], optimized=False)
 
     @staticmethod
     def _check_tensor(info, value, symbols):

@@ -89,6 +89,44 @@ class ReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "precision policy"):
             self.graph([], [], [], policy=False)
 
+    def gather(self, data, indices, axis):
+        graph = self.graph([h.make_node("GatherElements", ["X", "I"], ["Y"], axis=axis)],
+            [h.make_tensor_value_info("X", T.FLOAT, data.shape),
+             h.make_tensor_value_info("I", h.np_dtype_to_tensor_dtype(indices.dtype), indices.shape)],
+            [h.make_tensor_value_info("Y", T.FLOAT, indices.shape)])
+        return graph.run({"X": data, "I": indices})["Y"]
+
+    def test_gather_elements_tracker_sized_tensor(self):
+        data = np.arange(64 * 384, dtype=np.float32).reshape(1, 64, 384)
+        indices = np.broadcast_to(np.arange(63, -1, -1)[None, :, None], data.shape).astype(np.int64)
+        actual = self.gather(data, indices, 1)
+        np.testing.assert_array_equal(actual, data[:, ::-1, :])
+        self.assertEqual(actual.dtype, data.dtype)
+
+    def test_gather_elements_axes_negative_indices_and_smaller_dimensions(self):
+        data = np.arange(3 * 4 * 5, dtype=np.float32).reshape(3, 4, 5)
+        for axis in range(-3, 3):
+            for dtype in (np.int32, np.int64):
+                with self.subTest(axis=axis, dtype=dtype):
+                    size = data.shape[axis]
+                    indices = (np.arange(12).reshape(2, 3, 2) % (2 * size) - size).astype(dtype)
+                    expected = np.empty(indices.shape, np.float32)
+                    for position in np.ndindex(indices.shape):
+                        source = list(position)
+                        source[axis] = indices[position]
+                        expected[position] = data[tuple(source)]
+                    np.testing.assert_array_equal(self.gather(data, indices, axis), expected)
+
+    def test_gather_elements_rejects_out_of_bounds_indices(self):
+        for index in (-5, 4):
+            with self.subTest(index=index), self.assertRaises(IndexError):
+                self.gather(np.zeros((1, 4, 2), np.float32),
+                            np.full((1, 1, 2), index, np.int64), 1)
+
+    def test_gather_elements_rejects_broadcasting_non_axis_dimensions(self):
+        with self.assertRaises(ValueError):
+            self.gather(np.zeros((1, 4, 2), np.float32), np.zeros((2, 1, 2), np.int64), 1)
+
     def test_unknown_custom_op_rejected(self):
         with self.assertRaises((NotImplementedError, RuntimeError)):
             self.graph([h.make_node("missing", ["A"], ["Y"], domain="dpvo")],
@@ -176,7 +214,7 @@ class DeployedGraphTests(unittest.TestCase):
         fmap, imap = reference.feature(image)
         self.assertEqual(fmap.shape, (1, 1, 128, 8, 8))
         self.assertEqual(imap.dtype, np.float16)
-        for edges in (1, 4):
+        for edges in (1, 4, 64):
             idx = np.arange(edges, dtype=np.int64)
             missing = np.full(edges, -1, np.int64)
             result = reference.update(np.zeros((1, edges, 384), np.float16),

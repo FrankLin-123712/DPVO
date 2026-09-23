@@ -46,7 +46,7 @@ usage() {
 }
 
 gen_dpvo_runner_parity_small() {
-  echo "[INFO] Generating dpvo_runner_parity_small"
+  echo "[INFO] Generating $TESTDATA_ROOT/dpvo_runner_parity_small${SUFFIX}"
   "$PYTHON_BIN" "$SCRIPT_DIR/generate_dpvo_runner_parity_testdata.py" \
     --weights "$WEIGHTS" \
     --images "$IMAGES" \
@@ -61,7 +61,7 @@ gen_dpvo_runner_parity_small() {
 }
 
 gen_dpvo_python_fast_p16() {
-  echo "[INFO] Generating dpvo_python_fast_p16"
+  echo "[INFO] Generating $TESTDATA_ROOT/dpvo_python_fast_p16${SUFFIX}"
   "$PYTHON_BIN" "$SCRIPT_DIR/generate_dpvo_python_testdata.py" \
     --weights "$WEIGHTS" \
     --images "$IMAGES" \
