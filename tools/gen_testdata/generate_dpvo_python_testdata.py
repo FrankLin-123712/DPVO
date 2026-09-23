@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=REPO_ROOT / "testdata" / "dpvo_python_small",
+        default=None,
         help="Output directory for the compact input sequence and golden data.",
     )
     parser.add_argument(
@@ -213,7 +213,9 @@ def parse_args() -> argparse.Namespace:
             "Empty means all patches; set to 'none' to disable."
         ),
     )
-    return parser.parse_args()
+    from testdata_precision import add_precision_arguments, resolve_precision
+    add_precision_arguments(parser)
+    return resolve_precision(parser, parser.parse_args(), REPO_ROOT / "testdata" / "dpvo_python_small")
 
 
 def parse_ba_debug_patches(value: str) -> list[int] | None:
@@ -303,7 +305,7 @@ def build_tracker_config(args: argparse.Namespace) -> TrackerConfig:
         MOTION_MODEL=args.motion_model,
         MOTION_DAMPING=args.motion_damping,
         BA_ITERATIONS=2,
-        MIXED_PRECISION=args.mixed_precision,
+        MIXED_PRECISION=args.mixed_precision or getattr(args, "nn_precision", "fp32") == "fp16",
         NN_FP16_WEIGHTS=getattr(args, "nn_fp16_weights", False),
         LOOP_CLOSURE=False,
         BACKEND_THRESH=64.0,
@@ -717,6 +719,7 @@ def run_tracker(
     tracker_cfg: TrackerConfig,
     ba_debug_update_index: int,
     ba_debug_patches: list[int] | None,
+    nn_reference=None,
 ) -> tuple[
     Any,
     np.ndarray,
@@ -740,7 +743,11 @@ def run_tracker(
         raise RuntimeError("DPVO testdata generation requires CUDA because the Python tracker runs on GPU")
 
     height, width = frames[0].shape[:2]
-    slam = DPVO(tracker_cfg, str(weights), ht=height, wd=width, viz=False)
+    network = str(weights)
+    if nn_reference is not None:
+        from fp16_tracker_adapter import make_tracker_network
+        network = make_tracker_network(nn_reference)
+    slam = DPVO(tracker_cfg, network, ht=height, wd=width, viz=False)
     centers_by_frame: list[np.ndarray] = []
     bootstrap_depths_by_frame: list[np.ndarray | None] = [None] * len(frames)
     update_trace: list[dict[str, np.ndarray]] = []
@@ -1174,11 +1181,24 @@ def write_metadata(
         "ba_debug_update_index": int(args.ba_debug_update_index),
         "ba_debug_patches": parse_ba_debug_patches(args.ba_debug_patches),
     }
+    if getattr(args, "nn_reference_metadata", None) is not None:
+        metadata["weights"] = None  # ONNX initializers are authoritative; --weights is unused.
+        metadata["nn_reference"] = args.nn_reference_metadata
+        import torch
+        metadata["reference_environment"] = {"torch": torch.__version__, "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(), "tf32": False, "cudnn_deterministic": True}
     (output_root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     args = parse_args()
+    from testdata_precision import prepare_reference
+    nn_reference = prepare_reference(args)
+    if nn_reference is not None:
+        from testdata_precision import require_cuda_dpvo
+        require_cuda_dpvo()
+        args.nn_reference_metadata = nn_reference.metadata()
+        args.nn_reference_metadata["outside_network"] = "CUDA DPVO correlation/geometry/BA; not Gemmini PE reference"
     ba_debug_patches = parse_ba_debug_patches(args.ba_debug_patches)
     np.random.seed(args.seed)
     configure_determinism(args.seed)
@@ -1215,6 +1235,7 @@ def main() -> int:
         tracker_cfg,
         args.ba_debug_update_index,
         ba_debug_patches,
+        nn_reference=nn_reference,
     )
     active_tstamps = slam.pg.tstamps_[: slam.n].astype(np.int64, copy=False)
     active_patch_frames = slam.ix[: slam.m].detach().cpu().numpy().astype(np.int64, copy=False)
@@ -1262,6 +1283,11 @@ def main() -> int:
         tensors.update(dump_tracker_state(slam, tracker_cfg))
         tensors.update(dump_update_trace(update_trace))
 
+    if nn_reference is not None:
+        from testdata_precision import check_finite_case
+        check_finite_case(tensors)
+        for case in update_parity_cases:
+            check_finite_case(case)
     write_case(golden_dir, tensors)
     if args.dump_update_parity_cases:
         update_parity_root = write_update_parity_cases(args.output_root, update_parity_cases)

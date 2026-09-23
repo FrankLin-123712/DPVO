@@ -24,9 +24,22 @@ IMAGES=${IMAGES:-"$REPO_ROOT/sequences/IMG_0493"}
 CALIB=${CALIB:-"$REPO_ROOT/calib/iphone.txt"}
 TESTDATA_ROOT=${TESTDATA_ROOT:-"$REPO_ROOT/testdata"}
 MODE=${1:-0}
+NN_PRECISION=${NN_PRECISION:-fp32}
+PRECISION_ARGS=()
+SUFFIX=""
+case "$NN_PRECISION" in
+  fp32) ;;
+  fp16)
+    : "${ONNX_MODEL_DIR:?Set ONNX_MODEL_DIR to the converted FP16 ONNX model directory}"
+    PRECISION_ARGS=(--nn-precision fp16 --onnx-model-dir "$ONNX_MODEL_DIR")
+    SUFFIX="_fp16"
+    ;;
+  *) echo "[ERROR] NN_PRECISION must be fp32 or fp16" >&2; exit 2 ;;
+esac
+
 
 usage() {
-  echo "Usage: $0 [MODE]"
+  echo "Usage: NN_PRECISION=fp32|fp16 [ONNX_MODEL_DIR=...] $0 [MODE]"
   echo "  MODE=0  Generate all testdata"
   echo "  MODE=1  Generate dpvo_runner_parity_small"
   echo "  MODE=2  Generate dpvo_python_fast_p16"
@@ -38,7 +51,8 @@ gen_dpvo_runner_parity_small() {
     --weights "$WEIGHTS" \
     --images "$IMAGES" \
     --calib "$CALIB" \
-    --output-root "$TESTDATA_ROOT/dpvo_runner_parity_small" \
+    "${PRECISION_ARGS[@]}" \
+    --output-root "$TESTDATA_ROOT/dpvo_runner_parity_small${SUFFIX}" \
     --width 256 \
     --height 144 \
     --frame-start 1 \
@@ -52,7 +66,8 @@ gen_dpvo_python_fast_p16() {
     --weights "$WEIGHTS" \
     --images "$IMAGES" \
     --calib "$CALIB" \
-    --output-root "$TESTDATA_ROOT/dpvo_python_fast_p16" \
+    "${PRECISION_ARGS[@]}" \
+    --output-root "$TESTDATA_ROOT/dpvo_python_fast_p16${SUFFIX}" \
     --frame-count 32 \
     --max-long-edge 256 \
     --patches-per-frame 16 \
@@ -64,6 +79,7 @@ gen_dpvo_python_fast_p16() {
     --dump-state
 }
 
+echo "[INFO] NN_PRECISION: $NN_PRECISION (fp16 uses ONNX weights; --weights is unused)"
 echo "[INFO] MODE: $MODE"
 echo "[INFO] PYTHON_BIN: $PYTHON_BIN"
 

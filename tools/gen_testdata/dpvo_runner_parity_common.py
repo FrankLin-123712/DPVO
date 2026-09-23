@@ -250,6 +250,7 @@ def build_correlation_volume(
     fmap2: torch.Tensor,
     jj: torch.Tensor,
     coords: torch.Tensor,
+    half_storage: bool = False,
 ) -> torch.Tensor:
     edges = gmap.shape[0]
     diameter = 2 * CORR_RADIUS + 1
@@ -268,6 +269,17 @@ def build_correlation_volume(
                         y1 = float(coords[edge, 1, py, px]) + float(yoff)
                         x2 = float(coords[edge, 0, py, px]) / 4.0 + float(xoff)
                         y2 = float(coords[edge, 1, py, px]) / 4.0 + float(yoff)
+                        if half_storage:
+                            for level, (fmap, xx, yy) in enumerate(((fmap1_frame, x1, y1), (fmap2_frame, x2, y2))):
+                                x0, y0 = math.floor(xx), math.floor(yy)
+                                dx, dy = xx - x0, yy - y0
+                                dots = [torch.dot(src.float(), _safe_fetch_chw(fmap, y0+oy, x0+ox).float()).half().float()
+                                        for oy, ox in ((0, 0), (0, 1), (1, 0), (1, 1))]
+                                value = ((1-dy)*(1-dx)*dots[0] + (1-dy)*dx*dots[1]
+                                         + dy*(1-dx)*dots[2] + dy*dx*dots[3])
+                                out[0, edge, cursor+level] = value.half().float()
+                            cursor += 2
+                            continue
                         sample1 = bilinear_sample_chw(fmap1_frame, x1, y1)
                         sample2 = bilinear_sample_chw(fmap2_frame, x2, y2)
                         out[0, edge, cursor] = torch.dot(src, sample1)
@@ -361,10 +373,12 @@ def build_sequence_data(
     width: int,
     height: int,
     patches_per_frame: int,
+    nn_reference=None,
 ) -> SequenceData:
     torch.set_num_threads(1)
-    model = load_weights(weights).cpu().eval()
-    update = UpdateWrapperExplicitNeighbors(model).cpu().eval()
+    model = load_weights(weights).cpu().eval() if nn_reference is None else None
+    update = UpdateWrapperExplicitNeighbors(model).cpu().eval() if model is not None else None
+    half_storage = nn_reference is not None
 
     src_image = Image.open(image_paths[0])
     src_width, src_height = src_image.size
@@ -386,11 +400,16 @@ def build_sequence_data(
         image = load_normalized_image(image_path, height, width)
         image_batched = image.unsqueeze(0).unsqueeze(0)
         with torch.inference_mode():
-            raw_fmap = model.patchify.fnet(image_batched)
-            raw_imap = model.patchify.inet(image_batched)
+            if nn_reference is None:
+                raw_fmap = model.patchify.fnet(image_batched)
+                raw_imap = model.patchify.inet(image_batched)
+            else:
+                raw_fmap, raw_imap = [torch.from_numpy(v).float() for v in nn_reference.feature(tensor_to_numpy(image_batched))]
 
         fmap = (raw_fmap * 0.25).squeeze(0).squeeze(0).contiguous()
         imap_full = (raw_imap * 0.25).squeeze(0).squeeze(0).contiguous()
+        if half_storage:
+            fmap, imap_full = fmap.half().float(), imap_full.half().float()
         feature_height = fmap.shape[1]
         feature_width = fmap.shape[2]
         centers = select_patch_centers(image, patches_per_frame)
@@ -398,6 +417,8 @@ def build_sequence_data(
 
         patch_imap = patchify_single_chw(imap_full, centers, radius=0)
         gmap = patchify_single_chw(fmap, centers, radius=1)
+        if half_storage:
+            patch_imap, gmap = patch_imap.half().float(), gmap.half().float()
         colors = patchify_single_chw(image, 4.0 * (centers + 0.5), radius=0)[:, :, 0, 0]
         grid = build_grid_tensor(feature_height, feature_width)
         patchify_patches = patchify_single_chw(grid, centers, radius=1)
@@ -416,7 +437,8 @@ def build_sequence_data(
             )
         )
         fmap1_frames.append(fmap)
-        fmap2_frames.append(F.avg_pool2d(fmap.unsqueeze(0), 4, 4).squeeze(0).contiguous())
+        pooled = F.avg_pool2d(fmap.unsqueeze(0), 4, 4).squeeze(0).contiguous()
+        fmap2_frames.append(pooled.half().float() if half_storage else pooled)
         patch_list.append(geometry_patches)
         gmap_list.append(gmap)
         patch_imap_list.append(patch_imap)
@@ -435,14 +457,18 @@ def build_sequence_data(
     with torch.inference_mode():
         coords_python = pops.transform(poses_se3, patches_batched, intrinsics_batched, ii, jj, kk)
     coords = coords_python.squeeze(0).permute(0, 3, 1, 2).contiguous()
-    corr = build_correlation_volume(gmap[kk], fmap1, fmap2, jj, coords)
+    corr = build_correlation_volume(gmap[kk], fmap1, fmap2, jj, coords, half_storage=half_storage)
 
     ctx = patch_imap[kk, :, 0, 0].unsqueeze(0).contiguous()
     net = torch.zeros(1, kk.numel(), DIM, dtype=torch.float32)
     ix, jx = compute_neighbor_indices(kk, jj)
 
     with torch.inference_mode():
-        update_net, update_delta, update_weight = update(net, ctx, corr, ii, jj, kk, ix, jx)
+        if nn_reference is None:
+            update_net, update_delta, update_weight = update(net, ctx, corr, ii, jj, kk, ix, jx)
+        else:
+            update_net, update_delta, update_weight = [torch.from_numpy(v).float() for v in
+                nn_reference.update(*(tensor_to_numpy(v) for v in (net, ctx, corr, ii, jj, kk, ix, jx)))]
 
     target = coords_python[:, :, PATCH_SIZE // 2, PATCH_SIZE // 2, :] + update_delta
     bounds = torch.tensor(

@@ -13,7 +13,7 @@ TOOLS_DIR = SCRIPT_DIR.parent
 REPO_ROOT = TOOLS_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from dpvo_runner_parity_common import build_sequence_data, tensor_to_numpy, write_case  # noqa: E402
+import json
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=REPO_ROOT / "testdata" / "dpvo_runner_parity_small",
+        default=None,
         help="Root directory for generated component parity cases.",
     )
     parser.add_argument(
@@ -77,7 +77,9 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Number of deterministic patches per frame.",
     )
-    return parser.parse_args()
+    from testdata_precision import add_precision_arguments, resolve_precision
+    add_precision_arguments(parser)
+    return resolve_precision(parser, parser.parse_args(), REPO_ROOT / "testdata" / "dpvo_runner_parity_small")
 
 
 def collect_image_paths(image_dir: Path, frame_start: int, frame_count: int) -> list[Path]:
@@ -96,6 +98,13 @@ def collect_image_paths(image_dir: Path, frame_start: int, frame_count: int) -> 
 
 def main() -> int:
     args = parse_args()
+    from testdata_precision import prepare_reference
+    reference = prepare_reference(args)
+    if reference is not None:
+        from testdata_precision import require_cuda_dpvo
+        sys.path.insert(0, str(REPO_ROOT))
+        require_cuda_dpvo()
+    from dpvo_runner_parity_common import build_sequence_data, tensor_to_numpy, write_case
     image_paths = collect_image_paths(args.images, args.frame_start, args.frame_count)
     sequence = build_sequence_data(
         weights=args.weights,
@@ -104,6 +113,7 @@ def main() -> int:
         width=args.width,
         height=args.height,
         patches_per_frame=args.patches_per_frame,
+        nn_reference=reference,
     )
 
     patchify_case = OrderedDict(
@@ -117,6 +127,9 @@ def main() -> int:
             ("golden_colors", tensor_to_numpy(sequence.frames[0].colors, np.float32)),
         ]
     )
+    if reference is not None:
+        from testdata_precision import check_finite_case
+        check_finite_case(patchify_case)
     write_case(args.output_root / "patchify_small", patchify_case)
 
     correlation_case = OrderedDict(
@@ -134,6 +147,9 @@ def main() -> int:
             ("golden_corr", tensor_to_numpy(sequence.corr, np.float32)),
         ]
     )
+    if reference is not None:
+        from testdata_precision import check_finite_case
+        check_finite_case(correlation_case)
     write_case(args.output_root / "correlation_small", correlation_case)
 
     update_case = OrderedDict(
@@ -149,6 +165,9 @@ def main() -> int:
             ("golden_weight", tensor_to_numpy(sequence.update_weight, np.float32)),
         ]
     )
+    if reference is not None:
+        from testdata_precision import check_finite_case
+        check_finite_case(update_case)
     write_case(args.output_root / "update_small", update_case)
 
     bundle_adjustment_case = OrderedDict(
@@ -173,8 +192,20 @@ def main() -> int:
             ("golden_patches", tensor_to_numpy(sequence.ba_patches, np.float32)),
         ]
     )
+    if reference is not None:
+        from testdata_precision import check_finite_case
+        check_finite_case(bundle_adjustment_case)
     write_case(args.output_root / "bundle_adjustment_small", bundle_adjustment_case)
 
+    if reference is not None:
+        import torch
+        metadata = {"format": "dpvo_runner_parity_mixed_v1", "nn_reference": reference.metadata(),
+            "outside_network": "CPU float32 interpolation/pooling; half storage; float32 dot then half; CUDA FP32 BA",
+            "source_images": [str(p.resolve()) for p in image_paths], "calib": str(args.calib.resolve()),
+            "width": args.width, "height": args.height, "patches_per_frame": args.patches_per_frame,
+            "selection": "deterministic gradient centers and analytic depths/poses",
+            "torch": torch.__version__, "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name()}
+        (args.output_root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Generated parity cases under {args.output_root}")
     print(
         "frames=%d patches_per_frame=%d edges=%d size=%dx%d"
