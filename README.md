@@ -76,7 +76,7 @@ CUDA_HOME=/usr/local/cuda-12.3 TORCH_CUDA_ARCH_LIST="8.6+PTX" pip install --no-b
 
 
 ### Recommended - Install the Pangolin Viewer
-Note: You will need to have CUDA 11 and CuDNN installed on your system.
+Use a CUDA toolkit compatible with the active PyTorch environment; `environment.yml` currently selects PyTorch CUDA 12.1.
 
 1. Step 1: Install Pangolin (need the custom version included with the repo)
 ```
@@ -90,7 +90,7 @@ cd ../..
 
 2. Step 2: Install the viewer
 ```bash
-pip install ./DPViewer
+pip install --no-build-isolation ./DPViewer
 ```
 
 For installation issues, our [Docker Image](https://github.com/princeton-vl/DPVO_Docker) supports the visualizer.
@@ -124,14 +124,16 @@ DPVO can be run on any video or image directory with a single command. Note you 
 
 ```bash
 python demo.py \
-    --imagedir=<path to image directory or video> \
-    --calib=<path to calibration file> \
-    --viz # enable visualization
-    --plot # save trajectory plot
-    --save_ply # save point cloud as a .ply file
-    --save_trajectory # save the predicted trajectory as .txt in TUM format
-    --save_colmap # save point cloud + trajectory in the standard COLMAP text format
+    --imagedir="<path to image directory or video>" \
+    --calib="<path to calibration file>" \
+    --viz \
+    --plot \
+    --save_ply \
+    --save_trajectory \
+    --save_colmap
 ```
+
+These flags enable live visualization, save a trajectory plot, save a PLY point cloud, save a TUM-format trajectory, and save a COLMAP text reconstruction, respectively. Omit `--viz` when DPViewer is not installed.
 
 ### iPhone
 ```bash
@@ -150,6 +152,10 @@ Download a sequence from [EuRoC](https://projects.asl.ethz.ch/datasets/doku.php?
 python demo.py --imagedir=<path to mav0/cam0/data/> --calib=calib/euroc.txt --stride=2 --plot --viz
 ```
 
+### Tracker configuration and precision
+
+Use `--config config/fast_p16.yaml` to select a tracker preset and `--opts KEY VALUE ...` to override its settings. The standard `default`, `fast`, `fast_p16`, and `knee` presets use PyTorch mixed precision (`MIXED_PRECISION=True`) with FP32 model weights (`NN_FP16_WEIGHTS=False`). The corresponding `*_weight_fp16.yaml` presets also store network weights in FP16; they require `MIXED_PRECISION=True`. Geometry and BA state remain FP32. This PyTorch weight setting is separate from the converted ONNX reference backend used by `gen_testdata`.
+
 ## SLAM Backends
 To run DPVO with a SLAM backend (i.e., DPV-SLAM), add
 ```bash
@@ -163,10 +169,10 @@ If installed, the classical backend can also be enabled using
 ```
 
 ## Evaluation
-We provide evaluation scripts for TartanAir, EuRoC, TUM-RGBD and ICL-NUIM. Up to date result logs on these datasets can be found in the `logs` directory.
+We provide evaluation scripts for TartanAir, EuRoC, TUM-RGBD, ICL-NUIM, and KITTI. Existing result logs are in the `logs` directory.
 
 ### TartanAir:
-Results on the validation split and test set can be obtained with the command:
+Run the validation split with the following command; use `--split=test` for the test set:
 ```
 python evaluate_tartan.py --trials=5 --split=validation --plot --save_trajectory
 ```
@@ -193,7 +199,7 @@ python evaluate_kitti.py --trials=5 --plot --save_trajectory
 
 ## Tools
 
-The scripts under `tools/` cover ONNX export, workload estimation, runtime parity data generation, and video frame extraction. Run the commands below from the repository root after activating the `dpvo` environment. Use `python tools/<path-to-script>.py --help` for the complete option list.
+The scripts under `tools/` cover ONNX export, workload estimation and parameter sweeps, runtime parity/replay data generation, and video frame extraction. Run the commands below from the repository root after activating the `dpvo` environment. Use `python tools/<path-to-script>.py --help` for the complete option list of each standalone Python command.
 
 | Script | Purpose |
 | --- | --- |
@@ -204,8 +210,14 @@ The scripts under `tools/` cover ONNX export, workload estimation, runtime parit
 | `gen_testdata/gen_testdata.sh` | Generate the predefined end-to-end and component parity datasets. |
 | `gen_testdata/generate_dpvo_python_testdata.py` | Generate a resized input sequence and golden outputs from the Python DPVO tracker. |
 | `gen_testdata/generate_dpvo_runner_parity_testdata.py` | Generate patchify, correlation, update, and bundle-adjustment parity cases. |
+| `gen_testdata/generate_ba_benchmark_testdata.py` | Capture tracker BA calls as standalone benchmark cases. |
+| `gen_testdata/generate_patchify_replay_testdata.py` | Capture tracker patchify calls for FP32 replay; see [patchify replay](tools/gen_testdata/patchify_replay.md). |
+| `gen_testdata/generate_correlation_replay_testdata.py` | Capture tracker correlation calls for FP32 replay; see [correlation replay](tools/gen_testdata/correlation_replay.md). |
+| `gen_testdata/generate_update_replay_testdata.py` | Capture tracker update calls for FP32 replay; see [update replay](tools/gen_testdata/update_reply.md). |
+| `statistic_dpvo/` | Workload statistics, parameter sweeps, and dataset evaluation helpers; see its [README](tools/statistic_dpvo/README.md). |
 | `turn_mov2png.sh` | Convert every `.mov`/`.MOV` file in a directory to PNG frames. |
 | `gen_testdata/dpvo_runner_parity_common.py` | Internal support module for the runner parity generator; it is not a standalone command. |
+| `gen_testdata/fp16_onnx_reference.py` | Shared mixed-precision ONNX reference backend for the component/tracker generators; it is not a standalone command. |
 
 ### ONNX export and validation
 
@@ -288,7 +300,7 @@ Without `--edges`, the edge count is estimated from `PATCHES_PER_FRAME`, `PATCH_
 
 ### Test and parity data generation
 
-These generators expect an installed DPVO package and `dpvo.pth`. The end-to-end and runner parity generators also execute DPVO CUDA/custom operations; use a CUDA-enabled DPVO environment. Generated tensors are raw contiguous `.bin` files described by a `manifest.txt` file.
+The end-to-end and runner parity generators require a CUDA-enabled DPVO environment. Their default `fp32` mode loads `dpvo.pth`; `fp16` mode instead uses the converted ONNX models specified by `ONNX_MODEL_DIR`, and ignores the checkpoint. Generated tensors are raw contiguous `.bin` files described by a `manifest.txt` file. NN golden tensors are stored as float32 even in FP16 mode; half results are widened exactly for the existing readers. Other fields retain their declared types, including float64 tracker timestamps and uint8 point colors.
 
 Input frames are discovered in filename order and may be PNG or JPEG. Calibration files must contain at least `fx fy cx cy`; additional values are treated as distortion coefficients by the end-to-end generator.
 
@@ -298,16 +310,17 @@ Generate all predefined datasets:
 ./tools/gen_testdata/gen_testdata.sh 0
 ```
 
-The mode selects which dataset to generate:
+There are two dataset modes (`1` and `2`); `0` runs both and is the default when no mode is given:
 
-| Mode | Output under `testdata/` | Description |
+| Mode | Default output under `testdata/fp32/` | Description |
 | --- | --- | --- |
-| `0` | All outputs below | Generate every predefined dataset. This is also the default when no mode is given. |
+| `0` | Both outputs below | Run modes `1` and `2`. |
 | `1` | `dpvo_runner_parity_small/` | Four small component parity cases. |
-| `2` | `dpvo_python_medium_fast/` | 32-frame end-to-end case, 256-pixel maximum long edge, 16 patches per frame. |
-| `3` | `dpvo_python_medium/` | 32-frame end-to-end case, 512-pixel maximum long edge, 64 patches per frame. |
+| `2` | `dpvo_python_fast_p16/` | 32-frame end-to-end case, 256-pixel maximum long edge, 16 patches per frame. |
 
-The wrapper defaults to `dpvo.pth`, `subset_0493/`, `calib/iphone.txt`, and `testdata/`. Override them when using another sequence:
+Mode `1` uses 4 frames resized to 256×144 with 8 patches per frame. Mode `2` uses buffer size 40, removal window 16, optimization window 7, patch lifetime 11, seed 7, and `--dump-state`. The `p16` in its name means 16 patches per frame.
+
+The wrapper defaults to `dpvo.pth`, `sequences/IMG_0493/`, `calib/iphone.txt`, and `testdata/`, resolved relative to the repository root. Override them when using another sequence:
 
 ```bash
 PYTHON_BIN=/path/to/python \
@@ -318,6 +331,16 @@ TESTDATA_ROOT=/path/to/testdata \
 ./tools/gen_testdata/gen_testdata.sh 1
 ```
 
+For mixed-precision ONNX reference data:
+
+```bash
+NN_PRECISION=fp16 \
+ONNX_MODEL_DIR=/path/to/converted/models/fp16 \
+./tools/gen_testdata/gen_testdata.sh 0
+```
+
+This writes `testdata/fp16/dpvo_runner_parity_small_fp16/` and `testdata/fp16/dpvo_python_fast_p16_fp16/`. `TESTDATA_ROOT` is the parent of the precision directories; the wrapper appends `fp32/` or `fp16/` itself. The ONNX backend requires NumPy, ONNX, and converted opset11 models carrying `dpvo_precision_policy=compute_half_cpu_float_v1`; the default ONNX export above does not perform that conversion. Geometry and BA still use CUDA DPVO. See [FP16 test data](tools/gen_testdata/fp16_testdata.md) for the precision policy, dependencies, and limitations.
+
 To customize an end-to-end case directly:
 
 ```bash
@@ -325,7 +348,7 @@ python tools/gen_testdata/generate_dpvo_python_testdata.py \
     --weights ./dpvo.pth \
     --images ./subset_0493 \
     --calib ./calib/iphone.txt \
-    --output-root ./testdata/dpvo_python_small \
+    --output-root ./testdata/fp32/dpvo_python_small \
     --frame-start 1 --frame-count 12 --frame-step 1 \
     --max-long-edge 256 \
     --patches-per-frame 32 \
@@ -341,13 +364,17 @@ python tools/gen_testdata/generate_dpvo_runner_parity_testdata.py \
     --weights ./dpvo.pth \
     --images ./subset_0493 \
     --calib ./calib/iphone.txt \
-    --output-root ./testdata/dpvo_runner_parity_small \
+    --output-root ./testdata/fp32/dpvo_runner_parity_small \
     --width 256 --height 144 \
     --frame-start 1 --frame-count 4 \
     --patches-per-frame 8
 ```
 
-This creates `patchify_small/`, `correlation_small/`, `update_small/`, and `bundle_adjustment_small/`. Its defaults match the wrapper defaults for `dpvo.pth`, `subset_0493/`, `calib/iphone.txt`, and `testdata/dpvo_runner_parity_small/`. Bundle-adjustment golden generation requires CUDA.
+This creates `patchify_small/`, `correlation_small/`, `update_small/`, and `bundle_adjustment_small/`. Both Python generators default to `subset_0493/` for input images, while the shell wrapper uses `sequences/IMG_0493/`. Their default output roots are `testdata/fp32/dpvo_runner_parity_small/` and `testdata/fp32/dpvo_python_small/`, respectively. Bundle-adjustment golden generation requires CUDA.
+
+Both Python commands accept `--nn-precision fp16 --onnx-model-dir /path/to/converted/models/fp16`. When `--output-root` is omitted, they select `testdata/fp16/` and append `_fp16` to the dataset name. An explicit `--output-root` is used as supplied. Keep different precisions in separate directories: the generators reject a precision mismatch with existing metadata, and FP16 mode also rejects a nonempty directory without metadata.
+
+The BA benchmark and replay recorders in the tools table are separate commands; `gen_testdata.sh 0` runs only the two predefined datasets above.
 
 ### Convert MOV videos to PNG sequences
 
@@ -367,7 +394,7 @@ FPS=15 \
 ```
 
 ## Training
-Make sure you have run `./download_models_and_data.sh`. Your directory structure should look as follows
+Run `./download_models_and_data.sh` for the checkpoint, sample movies, and `datasets/TartanAir.pickle` index. The script does not download the TartanAir training images; obtain the training dataset separately. Your directory structure should look as follows
 
 ```Shell
 ├── datasets

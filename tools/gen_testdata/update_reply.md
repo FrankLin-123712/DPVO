@@ -5,12 +5,12 @@
 
 生成的資料可供完整 `DPVOTracker::Update()` 或獨立 update network replay 使用。
 C++ binary 的編譯、Spike／FireSim 執行及 profiling 報表請參閱
-[dpvo_runner 使用說明](../../../chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/README_update_replay.md)。
+[dpvo_runner 使用說明](../../../chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/docs/update_benchmark.md)。
 
 ## 1. 在 GPU 主機產生 EUROC testdata
 
 需要可正常跑此 DPVO repository 的 PyTorch/CUDA、CUDA extensions、NumPy、OpenCV，
-使用 YAML 時也需要 PyYAML。這台 server 沒有 GPU；正式 inference 與 golden 生成請在 GPU 主機執行。
+設定檔由共用的 top-level scalar YAML parser 讀取，不需要 PyYAML。正式 inference 與 golden 生成需要 GPU。
 
 ```bash
 cd /path/to/DPVO
@@ -22,13 +22,14 @@ python tools/gen_testdata/generate_update_replay_testdata.py \
   --width 752 --height 480 \
   --patches-per-frame 16 --centroid-sel-strat RANDOM \
   --no-mixed-precision --no-undistort --seed 7 \
-  --output-root testdata/update_replay_euroc_mh01_first16_p16
+  --output-root testdata/fp32/update_replay_euroc_mh01_first16_p16
 ```
 
 預設為 MH_01 前 16 幀、P16、seed 7、不去畸變、包含 `terminate()` 的最後 12 次 updates。
 `--frame-start` 是 1-based；metadata 的 `input_frame_index` 是 0-based。
 如需對照舊 workload，請使用相同 checkpoint、影像範圍、前處理及 tracker config，
-可傳 `--config-yaml FILE`。CLI/YAML 的優先順序沿用既有 generator；最後強制 FP32、關閉 TF32。
+可傳 `--config-yaml FILE`。YAML 的 tracker 參數優先於對應 CLI 參數；最後強制
+`MIXED_PRECISION=False`、`NN_FP16_WEIGHTS=False`，並關閉 TF32。
 不接受以 FP16 推論結果轉存 FP32 充當 FP32 golden。
 
 每個真正的 `tracker.update()` 產生一個 case，stage 為 `initialization`、`update` 或 `terminate`。
@@ -79,8 +80,8 @@ BA iterations、各設定與 tensor shapes 記錄於 case metadata。slot index 
 在 DPVO root 下，將整個 testdata root 搬到執行 runner 的 server，例如：
 
 ```bash
-rsync -aH testdata/update_replay_euroc_mh01_first16_p16/ \
-  SERVER:/home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/testdata/update_replay_euroc_mh01_first16_p16/
+rsync -aH testdata/fp32/update_replay_euroc_mh01_first16_p16/ \
+  SERVER:/home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/testdata/fp32/update_replay_euroc_mh01_first16_p16/
 ```
 
 gmap/fmap 以內容 hash 去重，case 下仍有完整 `.bin` 入口；`rsync -aH` 或 `tar` 可保留 hard links。
@@ -88,7 +89,7 @@ gmap/fmap 以內容 hash 去重，case 下仍有完整 `.bin` 入口；`rsync -a
 資料量取決於 edge 數、active frames 與 slot 更新；生成時只保留當次 case 的 tensor snapshots。
 
 請保留 root `metadata.json`、`cases.txt` 與 case 目錄結構。
-資料生成完成後，依 [dpvo_runner 使用說明](../../../chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/README_update_replay.md) 準備相同 checkpoint 的 ONNX 模型、
+資料生成完成後，依 [dpvo_runner 使用說明](../../../chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner/docs/update_benchmark.md) 準備相同 checkpoint 的 ONNX 模型、
 編譯 binary 並執行 replay。
 
 ## 4. 無 GPU 的 generator 開發檢查

@@ -57,7 +57,7 @@ one_at_a_time_sweep_report.md
 因此每個 candidate 的 `total_ops`、`total_memory_bytes` 與 `ate_m` 可以直接對應到
 「單一參數改變」造成的 workload / accuracy 變化。
 
-預設 sweep points：
+使用 `config/default.yaml` 時的預設 sweep points：
 
 - `PATCHES_PER_FRAME`: `96, 80, 64, 48, 32`
 - `PATCH_LIFETIME`: `13, 11, 9, 7, 5`
@@ -89,7 +89,8 @@ one_at_a_time_sweep_report.md
    - `--sweep-file`：用 JSON 自訂 sweep points。
    - `--run-eval`：除了 static estimator，也跑 EuRoC ATE。
    - `--python`：`evaluate_euroc_sweep.py` subprocess 使用的 Python。
-   - `--reuse-eval`：重用既有 `euroc_eval/*.json`，只重新彙整與畫圖。
+   - `--reuse-eval`：重用既有 `euroc_eval/*.json`；仍會重新產生 configs、執行 estimator、彙整與畫圖。
+   - `--no-keyframe`：只從 estimator 排除 keyframe motion test／factor pruning；不會改變 evaluator 的 tracker 行為。
 
 2. 讀取 base config。
 
@@ -197,7 +198,7 @@ one_at_a_time_sweep_report.md
    - `module_summary.csv`：所有 candidate 的 per-module long-form rows。
    - `sequence_errors.csv`：所有 candidate 的 per-scene ATE rows。
    - `sweep_plots/*_sweep.svg`：每個 parameter 一張圖。
-   - `one_at_a_time_sweep_report.md`：自動產生的實驗摘要。
+   - `tools/statistic_dpvo/one_at_a_time_sweep_report.md`：自動產生的實驗摘要，固定寫回工具目錄；即使指定不同 `--result-dir`，仍會覆寫這個檔案。
 
 ### 結果彙整方式
 
@@ -243,7 +244,7 @@ median ATE、mean ATE 與 trial ATE list。
 - 綠線：`ate_m`
 
 所有 sweep plots 對同一種 metric 使用共同 y-axis range。這樣不同 parameter 的圖
-可以直接比較趨勢。如果沒有跑 `--run-eval`，ATE 欄位是空的，圖上會顯示
+可以直接比較趨勢。如果沒有跑 `--run-eval`，也沒有透過 `--reuse-eval` 載入結果，ATE 欄位是空的，圖上會顯示
 ATE pending 的提示線。
 
 ## `statistic_dpvo.py`
@@ -344,8 +345,8 @@ tiling、DMA overlap、kernel launch、atomic、address generation、container o
 
    會讀取：
 
-   - `DPVO/exported_models/feature_extractor.onnx`
-   - `DPVO/exported_models/update_block.onnx`
+   - `DPVO/exported_models/opset_13/feature_extractor.onnx`
+   - `DPVO/exported_models/opset_13/update_block.onnx`
 
    程式內建 dependency-free protobuf reader，所以在 minimal deployment
    environment 裡不需要額外依賴完整 ONNX Python package。它會對 ONNX nodes 做
@@ -365,9 +366,8 @@ tiling、DMA overlap、kernel launch、atomic、address generation、container o
   traffic。
 - address generation 與 implementation-specific overhead 不計。
 - BA source-level formulas 使用 valid-residual path。
-- ONNX precision 依照 exported TensorProto dtype。目前 checked-in ONNX models 是
-  float32。
-- `FP16 Ops` 欄位目前通常是 0，只是 output schema 保留 precision bucket。
+- ONNX precision 依照輸入模型的 TensorProto dtype。預設 exporter 產生 FP32 模型，因此這類模型的 `FP16 Ops` 為 0；可用 `--onnx-dir` 指定模型目錄。
+- `MIXED_PRECISION`／`NN_FP16_WEIGHTS` 不會自動改寫 estimator 的 ONNX dtype。模型需先存在於指定目錄，estimator 不會替你匯出模型。
 - `FP64 Ops` 主要來自部分 C++ projective ops / BA formulas，不是 NN layer。
 
 ### 輸出欄位
@@ -485,24 +485,30 @@ trajectory 會以 TUM format 存在 `euroc_eval/saved_trajectories/`。
 
 ## 使用說明
 
-以下命令假設從 repository root 執行。
+以下命令都從 **DPVO repository 根目錄**執行（`cd /path/to/DPVO`）。static estimator／sweep 預設需要 `exported_models/opset_13/feature_extractor.onnx` 與 `update_block.onnx`，與主 README exporter 的預設輸出根目錄不同。在有 DPVO／PyTorch／ONNX 的環境先準備：
+
+```bash
+python tools/export2onnx/export_models.py --out exported_models/opset_13 --opset 13
+```
+
+若模型已在 `exported_models/`，單獨執行 estimator 可用 `--onnx-dir exported_models`。`sweep_dpvo.py` 目前沒有 `--onnx-dir` 旗標，仍使用 `exported_models/opset_13/`。estimator regression tests 也依賴這兩個預設位置的模型。
 
 ### 只跑 static estimator
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py
+python3 tools/statistic_dpvo/statistic_dpvo.py
 ```
 
 輸出 JSON：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py --format json
+python3 tools/statistic_dpvo/statistic_dpvo.py --format json
 ```
 
 用 module 粒度輸出：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
+python3 tools/statistic_dpvo/statistic_dpvo.py \
   --per-module \
   --format json
 ```
@@ -510,7 +516,7 @@ python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
 覆寫 algorithm parameters：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
+python3 tools/statistic_dpvo/statistic_dpvo.py \
   --pa PATCHES_PER_FRAME=48 \
   --pa PATCH_LIFETIME=11 \
   --pa REMOVAL_WINDOW=16 \
@@ -521,7 +527,7 @@ python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
 改變 estimator image size：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
+python3 tools/statistic_dpvo/statistic_dpvo.py \
   --height 384 \
   --width 512
 ```
@@ -529,7 +535,7 @@ python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
 輸出到檔案：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
+python3 tools/statistic_dpvo/statistic_dpvo.py \
   --per-module \
   --format csv \
   --output results/statistic_dpvo_default.csv
@@ -538,19 +544,21 @@ python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py \
 固定 `active_frames`：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/statistic_dpvo.py --active-frames 64
+python3 tools/statistic_dpvo/statistic_dpvo.py --active-frames 64
 ```
 
 執行 estimator regression tests：
 
 ```bash
-python3 -m unittest DPVO/tools/statistic_dpvo/test_statistic_dpvo.py
+python3 -m unittest discover -s tools/statistic_dpvo -p 'test_*.py' -v
 ```
+
+estimator 的 correlation accounting 仍使用 `E × 3 × 3 × 2 × 49 × (19 × 128 + 3)`，對應先插值 feature 再 dot 的舊公式。它尚未反映 runner 目前先算整數格點 dot、再插值 scalar correlation 的實作；涉及 correlation 的 ops／traffic 應視為此固定模型的估計，不是目前 kernel 的逐操作統計。
 
 ### 只跑 one-at-a-time static sweep
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py
+python3 tools/statistic_dpvo/sweep_dpvo.py
 ```
 
 這個命令只跑 estimator，不跑 EuRoC ATE。`sweep_summary.csv` 仍會產生，但 `ate_m`
@@ -559,14 +567,14 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py
 限制 sweep parameters：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
+python3 tools/statistic_dpvo/sweep_dpvo.py \
   --parameters PATCHES_PER_FRAME IMAGE_SIZE
 ```
 
 使用自訂 sweep file：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
+python3 tools/statistic_dpvo/sweep_dpvo.py \
   --sweep-file my_sweep.json
 ```
 
@@ -584,19 +592,19 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
 可以使用本資料夾的 downloader：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/download_euroc.py
+python3 tools/statistic_dpvo/download_euroc.py
 ```
 
 下載後目錄應符合：
 
 ```text
-DPVO/datasets/EUROC/<sequence>/mav0/cam0/data/*.png
+datasets/EUROC/<sequence>/mav0/cam0/data/*.png
 ```
 
 也要確認 ground truth 存在：
 
 ```text
-DPVO/datasets/euroc_groundtruth/<sequence>.txt
+datasets/euroc_groundtruth/<sequence>.txt
 ```
 
 ### 跑完整 sweep 加 EuRoC ATE
@@ -605,7 +613,7 @@ DPVO/datasets/euroc_groundtruth/<sequence>.txt
 
 ```bash
 conda activate dpvo
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
+python3 tools/statistic_dpvo/sweep_dpvo.py \
   --run-eval \
   --trials 3
 ```
@@ -614,7 +622,7 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
 environment：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
+python3 tools/statistic_dpvo/sweep_dpvo.py \
   --run-eval \
   --trials 3 \
   --python /home/remote/chiehchihlin/miniconda3/envs/dpvo/bin/python
@@ -623,7 +631,7 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
 常用縮小測試：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
+python3 tools/statistic_dpvo/sweep_dpvo.py \
   --run-eval \
   --trials 1 \
   --scenes MH_01_easy V1_01_easy \
@@ -634,14 +642,14 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
 讓 log 乾淨一點：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
+python3 tools/statistic_dpvo/sweep_dpvo.py \
   --run-eval \
   --trials 3 \
   --no-progress \
   --python /home/remote/chiehchihlin/miniconda3/envs/dpvo/bin/python
 ```
 
-完整預設 sweep 會跑約 33 個 candidates。若使用所有 11 個 EuRoC scenes 且
+使用 `config/default.yaml` 的完整預設 sweep 會跑 33 個 candidates（各參數組的重複 baseline 不去重）。若使用所有 11 個 EuRoC scenes 且
 `--trials 3`，會執行約 `33 x 11 x 3 = 1089` 個 scene-level trial，時間成本很高。
 建議先用少量 scenes / parameters 確認環境與輸出格式。
 
@@ -651,12 +659,12 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
 
 ```bash
 /home/remote/chiehchihlin/miniconda3/envs/dpvo/bin/python \
-  DPVO/tools/statistic_dpvo/evaluate_euroc_sweep.py \
-  --network DPVO/dpvo.pth \
-  --config DPVO/config/default.yaml \
-  --eurocdir DPVO/datasets/EUROC \
-  --output DPVO/tools/statistic_dpvo/statistic_result/euroc_eval/default.json \
-  --per-scene-csv DPVO/tools/statistic_dpvo/statistic_result/euroc_eval/default_scenes.csv \
+  tools/statistic_dpvo/evaluate_euroc_sweep.py \
+  --network dpvo.pth \
+  --config config/default.yaml \
+  --eurocdir datasets/EUROC \
+  --output tools/statistic_dpvo/statistic_result/euroc_eval/default.json \
+  --per-scene-csv tools/statistic_dpvo/statistic_result/euroc_eval/default_scenes.csv \
   --height 480 \
   --width 640 \
   --stride 2 \
@@ -670,24 +678,41 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py \
 
 ```bash
 /home/remote/chiehchihlin/miniconda3/envs/dpvo/bin/python \
-  DPVO/tools/statistic_dpvo/evaluate_euroc_sweep.py \
-  --config DPVO/config/default.yaml \
-  --output DPVO/tools/statistic_dpvo/statistic_result/euroc_eval/default_small.json \
+  tools/statistic_dpvo/evaluate_euroc_sweep.py \
+  --config config/default.yaml \
+  --output tools/statistic_dpvo/statistic_result/euroc_eval/default_small.json \
   --scenes MH_01_easy V1_01_easy \
   --trials 1
 ```
 
 ### 重用既有 ATE JSON
 
-如果 `statistic_result/euroc_eval/*.json` 已經存在，可以不重跑 DPVO，只重新合併
-summary 與重畫 plots：
+如果 `statistic_result/euroc_eval/*.json` 已經存在，可以不重跑 DPVO；程式仍會重建 candidate configs、重算 static workload，再合併 summary 與重畫 plots：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py --reuse-eval
+python3 tools/statistic_dpvo/sweep_dpvo.py --reuse-eval
 ```
 
 若只想重用部分 parameters 的 evaluator JSON，也要給相同的 `--parameters`，讓本次
-產生的 candidate IDs 對得上既有檔案。
+產生的 candidate IDs 對得上既有檔案。缺少 JSON 的 candidate 保持 `not_run`；若同時加 `--run-eval`，則通過 preflight 後會評估缺少的項目。程式目前僅依 candidate ID 找 JSON，不會核對 checkpoint、config、scenes、stride 或 trials，重用前應確認這些條件一致。
+
+## KITTI evaluator 與下載工具
+
+`evaluate_kitti_sweep.py` 是獨立的單一 config evaluator；`sweep_dpvo.py` 目前只自動呼叫 EuRoC evaluator。
+
+```bash
+python3 tools/statistic_dpvo/download_kitti.py --help
+python3 tools/statistic_dpvo/evaluate_kitti_sweep.py \
+  --config config/fast.yaml \
+  --kittidir datasets/KITTI \
+  --output tools/statistic_dpvo/statistic_result/kitti_fast.json \
+  --per-sequence-csv tools/statistic_dpvo/statistic_result/kitti_fast_sequences.csv \
+  --resolution native --trials 3
+```
+
+預設使用 `dataset/sequences/00` 至 `10` 的 `image_2/`、各 sequence 的 `calib.txt`，以及 `dataset/poses/<sequence>.txt`。`native` 向下 crop 至 16 倍數；`low` 對原圖分別套用高度 `320/480`、寬度 `416/640` 的縮放比例後向下對齊，並不是固定輸出 320×416。要固定尺寸，成對指定 `--height`、`--width`（都須為 16 倍數）。
+
+KITTI 指標為分段相對位姿誤差：translation 是百分比，rotation 是 deg/m，JSON 另提供 deg/100m。預設 stride=2、trials=3，`--align` 與 `--correct-scale` 預設皆關閉，需明確啟用。`avg_*` 是各 sequence 的 trial mean 再取平均，`avg_median_*` 則是各 sequence 的 trial median 再取平均。這與 EuRoC 的 scale-corrected ATE 是不同指標。
 
 ## 建議分析方式
 

@@ -6,7 +6,7 @@ The workflow has four outputs under statistic_result/:
 1. generated_configs/: one YAML config per candidate;
 2. per_module/: exact per-module estimator JSON/CSV for every candidate;
 3. sweep_summary.csv and module_summary.csv;
-4. sweep_plots/*.svg plus one_at_a_time_sweep_report.md.
+4. sweep_plots/*.svg. The Markdown report is written beside this script.
 
 ATE evaluation is optional because it requires the full EuRoC image dataset,
 CUDA-enabled DPVO dependencies, and the compiled DPVO extensions.  Use
@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+import shlex
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -776,7 +777,7 @@ def percent_reduction(default: float, value: float) -> float:
 
 def report_table(summary_rows: Sequence[dict[str, Any]]) -> str:
     lines = [
-        "| parameter | 最低 candidate | 相對 sweep 起點的 ops 降幅 | 相對 sweep 起點的 mem 降幅 | ATE 狀態 |",
+        "| parameter | 最後 candidate | 相對 sweep 起點的 ops 降幅 | 相對 sweep 起點的 mem 降幅 | ATE 狀態 |",
         "| --- | ---: | ---: | ---: | --- |",
     ]
     for parameter in PARAMETER_ORDER:
@@ -787,7 +788,8 @@ def report_table(summary_rows: Sequence[dict[str, Any]]) -> str:
         endpoint = rows[-1]
         ops_drop = percent_reduction(float(baseline["total_ops"]), float(endpoint["total_ops"]))
         mem_drop = percent_reduction(float(baseline["total_memory_bytes"]), float(endpoint["total_memory_bytes"]))
-        ate_status = "完成" if endpoint["ate_m"] != "" else "待補"
+        completed = sum(row["ate_m"] != "" for row in rows)
+        ate_status = f"{completed}/{len(rows)} candidates 完成"
         lines.append(
             f"| `{PARAMETER_LABELS[parameter]}` | `{endpoint['sweep_value']}` | "
             f"{ops_drop:.1f}% | {mem_drop:.1f}% | {ate_status} |"
@@ -796,102 +798,66 @@ def report_table(summary_rows: Sequence[dict[str, Any]]) -> str:
 
 
 def write_report(args: argparse.Namespace, summary_rows: Sequence[dict[str, Any]]) -> None:
-    any_ate = any(row["ate_m"] != "" for row in summary_rows)
-    command = (
-        "python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py --run-eval --trials 3"
-    )
-    if args.parameters != PARAMETER_ORDER:
-        command += " --parameters " + " ".join(args.parameters)
+    command = ["python3", "tools/statistic_dpvo/sweep_dpvo.py"]
+    for option in ("config", "result_dir", "network", "eurocdir", "python"):
+        command.extend(["--" + option.replace("_", "-"), str(getattr(args, option).absolute())])
+    for option in ("active_frames", "stride", "trials", "seed", "backend_thresh"):
+        command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
+    command.extend(["--scenes", *args.scenes, "--parameters", *args.parameters])
+    if args.sweep_file is not None:
+        command.extend(["--sweep-file", str(args.sweep_file.resolve())])
+    for option in ("run_eval", "reuse_eval", "no_progress", "no_keyframe"):
+        if getattr(args, option):
+            command.append("--" + option.replace("_", "-"))
 
+    points = []
+    for parameter in PARAMETER_ORDER:
+        rows = [row for row in summary_rows if row["sweep_parameter"] == parameter]
+        if rows:
+            values = ", ".join(str(row["sweep_value"]) for row in rows)
+            points.append(f"- `{PARAMETER_LABELS[parameter]}`: {values}")
+    completed = sum(row["ate_m"] != "" for row in summary_rows)
+    points_text = "\n".join(points) or "沒有 candidate。"
     report = f"""# DPVO One-at-a-Time Algorithmic Parameter Sweep 報告
 
-## 範圍
+## 範圍與重現方式
 
-這份報告由 `tools/statistic_dpvo/sweep_dpvo.py` 產生。Sweep 方式是從
-`config/default.yaml` 出發，每次只改動一個 tunable parameter。對
-`{PARAMETER_LABELS['IMAGE_SIZE']}` 而言，基準點定義為
-`{DEFAULT_HEIGHT}x{DEFAULT_WIDTH}`，也就是 `statistic_dpvo.py` 使用的預設輸入尺寸。
-`BA_ITERATIONS` 依本次需求改為由 `20` 逐步下降到 default `2`。
+Base config：`{args.config.resolve()}`。每次只改一個參數；非 IMAGE_SIZE
+candidate 使用 {DEFAULT_HEIGHT}×{DEFAULT_WIDTH}。Estimator reference horizon
+為 {args.active_frames} 個 accepted frames。結果目錄：`{args.result_dir.resolve()}`。
 
-EuRoC sequences 依照 DPVO 論文 Table 2，以及本 repository 的
-`evaluate_euroc.py`：{", ".join(EUROC_SCENES)}。
+EuRoC scenes：{", ".join(args.scenes)}。stride={args.stride}、trials={args.trials}、
+seed={args.seed}。ATE 是各 scene 的 trial median 再取平均，單位為 m。
 
-## 重現方式
-
-先準備資料與 runtime 環境：
+從 DPVO repository 根目錄執行以下命令；保留相同 config、模型、資料及自訂 sweep file。
+`--reuse-eval` 也需要保留原 evaluator JSON；檔名相同不代表實驗條件相同。
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/download_euroc.py
-conda activate dpvo
+{shlex.join(command)}
 ```
 
-執行完整 sweep：
+## 本次 Sweep 離散點（執行順序）
 
-```bash
-{command}
-```
+{points_text}
 
-產生的輸出：
-
-- `statistic_result/generated_configs/*.yaml`
-- `statistic_result/per_module/*.json`
-- `statistic_result/per_module/*.csv`
-- `statistic_result/sweep_summary.csv`
-- `statistic_result/module_summary.csv`
-- `statistic_result/sequence_errors.csv`
-- `statistic_result/sweep_plots/*_sweep.svg`
-
-## Sweep 離散點
-
-- `PATCHES_PER_FRAME`: 96, 80, 64, 48, 32
-- `PATCH_LIFETIME`: 13, 11, 9, 7, 5
-- `REMOVAL_WINDOW`: 22, 18, 14, 10
-- `OPTIMIZATION_WINDOW`: 10, 8, 6, 4
-- `BA_ITERATIONS`: 20, 18, 16, 14, 12, 10, 8, 6, 4, 2
-- `{PARAMETER_LABELS['IMAGE_SIZE']}`: 480x640, 384x512, 320x416, 240x320, 192x256
-
-## 目前結果摘要
+## 結果摘要
 
 {report_table(summary_rows)}
 
-ATE 狀態：{"已完成" if any_ate else "待補。這次執行沒有進行 EuRoC image evaluation；需要在具備完整 EuRoC image dataset 的 DPVO runtime 環境中執行上方命令，才會填入 ATE 欄位。"}
+ATE 已有結果：{completed}/{len(summary_rows)} candidates。缺少的 ATE 不代表零誤差；
+各 candidate 的 `evaluation_status` 見 `sweep_summary.csv`。
+降幅以同組第一個 candidate 對最後一個計算；負值代表增加，不一定是從最大參數到最小參數。
 
-所有 sweep plots 針對同一個 metric 共用同一組 y-axis range：藍線的 total ops 軸
-在所有圖一致，橘色虛線的 total mem 軸在所有圖一致，ATE 軸也會在所有圖一致。若尚未
-執行 ATE evaluation，綠色虛線只代表 ATE pending；等 `--run-eval` 產生 `ate_m`
-後會改畫實際 ATE 曲線。
+輸出目錄包含 `generated_configs/`、`per_module/`、`sweep_summary.csv`、
+`module_summary.csv`、`sequence_errors.csv`、`sweep_plots/`，以及有評估結果時的 `euroc_eval/`。
+本 Markdown 固定寫入 `tools/statistic_dpvo/one_at_a_time_sweep_report.md`，下一次 sweep 會覆寫。
 
-## 分析
+## 解讀限制
 
-Static estimator 顯示，當各參數逐步下降時，logical workload 符合預期地下降。
-`PATCHES_PER_FRAME`、`PATCH_LIFETIME` 與 `REMOVAL_WINDOW` 會直接降低 active
-factor count，因此會同時影響 update、correlation 與 BA-heavy modules。
-`OPTIMIZATION_WINDOW` 主要縮小 BA 中 free pose 的維度，所以對 front-end
-neural-network workload 的影響較小，但仍可能影響 trajectory consistency。
-新的 `BA_ITERATIONS` sweep 從 `20` 下降到 `2`；這能量化 solver refinement 次數
-對 BA workload 的線性影響，也能在後續 ATE 補齊時判斷 iteration 是否有 accuracy
-收益。較小的 `{PARAMETER_LABELS['IMAGE_SIZE']}` 會降低 feature extraction 與
-correlation traffic，但也會改變輸入影像訊號，並可能和 patch selection 產生強交互作用。
-
-## 候選 Algorithmic Parameter Sets P_a
-
-ATE 補齊後，建議先驗證下列候選組合：
-
-- `P_a_default`: `PATCHES_PER_FRAME=96`, `PATCH_LIFETIME=13`,
-  `REMOVAL_WINDOW=22`, `OPTIMIZATION_WINDOW=10`, `BA_ITERATIONS=2`,
-  `H,W=480x640`.
-- `P_a_balanced`: `PATCHES_PER_FRAME=64`, `PATCH_LIFETIME=11`,
-  `REMOVAL_WINDOW=18`, `OPTIMIZATION_WINDOW=8`, `BA_ITERATIONS=2`,
-  `H,W=384x512`.
-- `P_a_aggressive`: `PATCHES_PER_FRAME=48`, `PATCH_LIFETIME=9`,
-  `REMOVAL_WINDOW=14`, `OPTIMIZATION_WINDOW=6`, `BA_ITERATIONS=2`,
-  `H,W=320x416`.
-
-最終選擇規則：保留 EuRoC average ATE 增幅仍在 project tolerance 內的 candidates，
-再從這些 survivors 中選擇 total ops / total memory 最低的點。在目前尚未補齊 ATE
-前，`P_a_balanced` 是較適合作為第一個 combined candidate 的保守選擇，因為它避開
-最容易影響 accuracy 的變更（過低 `BA_ITERATIONS` 與過低 image size），同時仍能降低
-factor-graph size。
+Ops 與 memory 是 estimator 的固定 layer-boundary accounting，沒有量測硬體 latency。
+Correlation 仍使用先插值 feature 再 dot 的舊公式，尚未反映 runner 新的整數格點 dot 路徑。
+各圖共用同 metric 的 y-axis range；藍線為 ops、橘線為 memory、綠線為 ATE。
+單參數結果不能證明 combined config 的 accuracy；組合參數後需另跑 evaluator。
 """
     (TOOLS_DIR / "one_at_a_time_sweep_report.md").write_text(report)
 

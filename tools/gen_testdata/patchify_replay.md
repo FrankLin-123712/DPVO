@@ -7,7 +7,7 @@
 ## GPU 上產生 EUROC 資料
 
 使用已能執行此 repository DPVO 的 GPU 環境：PyTorch/CUDA、DPVO CUDA extensions、
-NumPy、OpenCV；讀取 YAML 設定時也需要 PyYAML。此 server 沒有 GPU，正式生成請在 GPU 主機執行。
+NumPy、OpenCV。設定檔由共用的 top-level scalar YAML parser 讀取，不需要 PyYAML；正式生成需要 GPU。
 
 ```bash
 cd /path/to/DPVO
@@ -19,7 +19,7 @@ python tools/gen_testdata/generate_patchify_replay_testdata.py \
   --width 752 --height 480 \
   --patches-per-frame 16 --centroid-sel-strat RANDOM \
   --no-mixed-precision --no-undistort --seed 7 \
-  --output-root testdata/patchify_replay_euroc_mh01_first16_p16
+  --output-root testdata/fp32/patchify_replay_euroc_mh01_first16_p16
 ```
 
 預設也是 MH_01 前 16 幀、P16、最長邊 752、seed 7，不做 undistortion。

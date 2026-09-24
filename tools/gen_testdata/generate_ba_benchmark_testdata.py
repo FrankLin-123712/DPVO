@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=REPO_ROOT / "testdata" / "ba_benchmark_euroc_mh01_first16_fast_p16",
+        default=REPO_ROOT / "testdata" / "fp32" / "ba_benchmark_euroc_mh01_first16_fast_p16",
     )
     parser.add_argument("--frame-start", type=int, default=1)
     parser.add_argument("--frame-count", type=int, default=16)
@@ -478,7 +478,7 @@ def main() -> int:
         encoding="utf-8",
     )
     (args.output_root / "cases.txt").write_text(
-        "\n".join(record["case_dir"] for record in case_records) + "\n",
+        "\n".join(Path(record["case_dir"]).name for record in case_records) + "\n",
         encoding="utf-8",
     )
 

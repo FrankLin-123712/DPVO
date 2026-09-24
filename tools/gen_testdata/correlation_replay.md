@@ -21,7 +21,7 @@ python3 tools/gen_testdata/generate_correlation_replay_testdata.py \
   --frame-start 1 --frame-count 16 --frame-step 1 \
   --width 752 --height 480 \
   --no-undistort --no-mixed-precision --seed 7 \
-  --output-root testdata/correlation_replay_euroc_mh01_first16_p16
+  --output-root testdata/fp32/correlation_replay_euroc_mh01_first16_p16
 ```
 
 輸出目錄必須不存在或為空，避免覆寫先前案例。每次 correlation 完成後會
@@ -29,8 +29,8 @@ python3 tools/gen_testdata/generate_correlation_replay_testdata.py \
 可用 `--skip-terminate-updates` 排除最後更新。沒有固定期待 39 次：Python 與
 C++ 的追蹤狀態、數值與 edge graph 可能不同。
 
-YAML 的 tracker 參數優先於 CLI 的對應參數，但 `MIXED_PRECISION` 最後一律
-覆蓋為 `False`，即使 YAML 寫 `True`。TF32 關閉，seed 同時設定 torch、NumPy
+YAML 的 tracker 參數優先於 CLI 的對應參數，但 `MIXED_PRECISION` 與 `NN_FP16_WEIGHTS` 最後一律
+覆蓋為 `False`，即使 YAML 寫 `True`。共用 parser 只解析 top-level scalar，無需 PyYAML。TF32 關閉，seed 同時設定 torch、NumPy
 與 Python random；不同 GPU／CUDA 版本仍不保證 bitwise reproducibility。
 Loop closure 關閉。影像預設不去畸變；`--undistort` 可明確啟用。前處理沿用
 原工具的 resize／16 倍數對齊，對其他解析度不等同 C++ 的 crop；本案例的
@@ -135,7 +135,7 @@ dtype 正確、shape 正確、浮點值有限。失敗時根 metadata 會標記 
 | `--weights PATH` | DPVO/dpvo.pth，請指定實際 checkpoint |
 | `--images DIR` | DPVO/datasets/EUROC/MH_01_easy/mav0/cam0/data |
 | `--calib PATH` | DPVO/calib/euroc.txt |
-| `--output-root DIR` | DPVO/testdata/correlation_replay_euroc_mh01_first16_p16，必須不存在或為空 |
+| `--output-root DIR` | DPVO/testdata/fp32/correlation_replay_euroc_mh01_first16_p16，必須不存在或為空 |
 | `--config-yaml PATH` | 選用 C++ runner config；對應 tracker 參數優先於 CLI |
 | `--frame-start N` | 1，按檔名排序後的 1-based 起始影像 |
 | `--frame-count N` | 16，至少 8 張 |
@@ -170,9 +170,10 @@ dtype 正確、shape 正確、浮點值有限。失敗時根 metadata 會標記 
 
 ```bash
 DPVO_RUNNER=/home/cclin/chipyard/generators/gemmini/software/onnxruntime-riscv/systolic_runner/dpvo_runner
-CORR_CASES=/home/cclin/DPVO/testdata/correlation_replay_euroc_mh01_first16_p16
+CORR_CASES=/home/cclin/DPVO/testdata/fp32/correlation_replay_euroc_mh01_first16_p16
 cd "$DPVO_RUNNER"
-./build.sh --config=Release --parallel --correlation-benchmark --host --host-tests -O2
+./build.sh --config=Release --parallel --host-tests -O2
+./build.sh --config=Release --parallel --correlation-benchmark --host -O2
 python3 tools/test_correlation_replay.py --binary build/host/Release/run_correlation
 python3 tools/test_correlation_scripts.py
 ./build.sh --config=Release --parallel --correlation-benchmark -O2
@@ -183,13 +184,13 @@ python3 tools/test_correlation_scripts.py
 建置用 `--correlation-benchmark` 選目標，再自行組合旗標：`--host` 改用
 x86 native compiler；`--for_firesim` 僅加入 FOR_FIRESIM definition；兩者皆不加
 時預設編譯 RISC-V rv64，可交給 Spike。`--parallel` 啟用平行編譯。
-最佳化須明確指定 -O0／-O2／-O3，Release 不自動設定 O2。
+目前 Release 預設 -O3、Debug 預設 -O0；-O0／-O2／-O3 可覆寫。上例固定使用 -O2。
 
 RISC-V 輸出為 `build/Release/run_correlation`，host 為
 `build/host/Release/run_correlation`。預設 config 是 Debug；上例明確選 Release。
-`--host-tests` 執行 host core tests；replay 和腳本測試使用上述 Python 命令。
+`--host-tests` 執行 host core tests 後即結束，因此需另一次呼叫建置 benchmark；replay 和腳本測試使用上述 Python 命令。
 
-Gemmini Spike 測試需明確指定 matching FP32 extension：
+wrapper 會依精度選擇並建置本機 Gemmini extension；若需覆寫，使用與 binary／硬體設定相符的 FP32 extension：
 
 ```bash
 ./run_corr_spike.sh --case_dir "$CORR_CASES/case_0000" -x 2 \

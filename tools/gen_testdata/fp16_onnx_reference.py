@@ -1,7 +1,8 @@
-"""Independent graph reference: half operands/results, float32 reductions.
+"""Independent graph reference: half operands/results, selectable accumulation.
 
 Uses ONNX ReferenceEvaluator operators, NOT ORT/Systolic kernels. No torch/CUDA
 dependency here; the tracker adapter is in fp16_tracker_adapter.py.
+Imported by the component/tracker generators; this module has no standalone CLI.
 """
 from __future__ import annotations
 
@@ -14,6 +15,8 @@ from onnx.reference import ReferenceEvaluator
 from onnx.reference.op_run import OpRun
 
 POLICY = "compute_half_cpu_float_v1"
+ACCUMULATIONS = {"fp32": "float32_reference_not_gemmini_pe",
+                 "gemmini-dim32": "gemmini_dim32_fp16_fma_fp32_acc"}
 ACCELERATED = {"Conv", "MatMul", "Gemm"}
 CPU_OPS = {"Constant", "Relu", "Unsqueeze", "Shape", "Gather", "InstanceNormalization",
            "Add", "Concat", "Reshape", "Mul", "ReduceMean", "Sub", "Div",
@@ -26,6 +29,47 @@ def _float_operands(*values):
         if value is not None and value.dtype != np.float16:
             raise TypeError("Accelerated operands must be float16, including bias")
     return [None if v is None else v.astype(np.float32) for v in values]
+
+
+def _dim32_matmul(a, b, bias=None):
+    """K-ordered half FMA, FP32 sums between 32-element blocks (RNE).
+
+    Binary64 represents a half*half product exactly. Add the half partial sum
+    in binary64 and convert directly to half, avoiding an intermediate FP32
+    rounding or a separately rounded half product. Vectorize output elements,
+    not K, so NumPy/BLAS cannot reorder the reduction.
+    """
+    left_vector, right_vector = a.ndim == 1, b.ndim == 1
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if left_vector:
+        a = a[None, :]
+    if right_vector:
+        b = b[:, None]
+    if a.ndim < 2 or b.ndim < 2 or a.shape[-1] != b.shape[-2]:
+        raise ValueError("Invalid MatMul dimensions")
+    batch = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    a = np.broadcast_to(a, batch + a.shape[-2:])
+    b = np.broadcast_to(b, batch + b.shape[-2:])
+    m, k, n = a.shape[-2], a.shape[-1], b.shape[-1]
+    out = np.empty(batch + (m, n), dtype=np.float32)
+    out[...] = 0 if bias is None else bias
+    for index in np.ndindex(batch):
+        for row in range(0, m, 256):
+            acc = out[index][row:row + 256]
+            left = a[index][row:row + 256]
+            right = b[index]
+            partial = np.empty(acc.shape, dtype=np.float64)
+            for start in range(0, k, 32):
+                partial.fill(0)
+                for t in range(start, min(start + 32, k)):
+                    partial = (left[:, t, None] * right[t] + partial).astype(np.float16).astype(np.float64)
+                acc += partial.astype(np.float32)
+    if left_vector:
+        out = np.squeeze(out, axis=-2)
+    if right_vector:
+        out = np.squeeze(out, axis=-1)
+    return out
 
 
 class GatherElements(OpRun):
@@ -53,18 +97,27 @@ class GatherElements(OpRun):
 
 class MatMul(OpRun):
     op_domain = ""
+    accumulation = "fp32"
 
     def _run(self, a, b):
         a, b = _float_operands(a, b)
-        return (np.matmul(a, b).astype(np.float16),)
+        matmul = _dim32_matmul if self.accumulation == "gemmini-dim32" else np.matmul
+        return (matmul(a, b).astype(np.float16),)
 
 
 class Gemm(OpRun):
     op_domain = ""
+    accumulation = "fp32"
 
     def _run(self, a, b, c=None, alpha=1.0, beta=1.0, transA=0, transB=0):
         a, b, c = _float_operands(a, b, c)
-        y = np.float32(alpha) * np.matmul(a.T if transA else a, b.T if transB else b)
+        a, b = a.T if transA else a, b.T if transB else b
+        matmul = _dim32_matmul if self.accumulation == "gemmini-dim32" else np.matmul
+        if self.accumulation == "gemmini-dim32" and alpha == 0:
+            sums = np.zeros((a.shape[0], b.shape[1]), np.float32)
+        else:
+            sums = matmul(a, b)
+        y = np.float32(alpha) * sums
         if c is not None and beta != 0:
             y = y + np.float32(beta) * c
         return (y.astype(np.float16),)
@@ -72,6 +125,7 @@ class Gemm(OpRun):
 
 class Conv(OpRun):
     op_domain = ""
+    accumulation = "fp32"
 
     def _run(self, X, W, B=None, auto_pad="NOTSET", dilations=None,
              group=1, kernel_shape=None, pads=None, strides=None):
@@ -108,15 +162,24 @@ class Conv(OpRun):
         windows = windows[:, :, ::sh, ::sw, ::dh, ::dw]
         n, _, oh, ow, _, _ = windows.shape
         cin, cout = w.shape[1], w.shape[0] // group
+        if bias is not None and bias.shape != (w.shape[0],):
+            raise ValueError("Invalid Conv bias shape")
         y = np.empty((n, w.shape[0], oh, ow), dtype=np.float32)
         for g in range(group):
-            a = windows[:, g*cin:(g+1)*cin].transpose(0, 2, 3, 1, 4, 5)
+            pe_order = self.accumulation == "gemmini-dim32"
+            # Deployed Conv reduces K in (kernel_y, kernel_x, channel) order.
+            axes = (0, 2, 3, 4, 5, 1) if pe_order else (0, 2, 3, 1, 4, 5)
+            a = windows[:, g*cin:(g+1)*cin].transpose(axes)
             a = np.ascontiguousarray(a).reshape(n*oh*ow, -1)
-            b = w[g*cout:(g+1)*cout].reshape(cout, -1)
-            y[:, g*cout:(g+1)*cout] = (a @ b.T).reshape(n, oh, ow, cout).transpose(0, 3, 1, 2)
-        if bias is not None:
-            if bias.shape != (w.shape[0],):
-                raise ValueError("Invalid Conv bias shape")
+            weights = w[g*cout:(g+1)*cout]
+            if pe_order:
+                b = weights.transpose(2, 3, 1, 0).reshape(-1, cout)
+                # Conv bias initializes the FP32 accumulator, before K blocks.
+                values = _dim32_matmul(a, b, None if bias is None else bias[g*cout:(g+1)*cout])
+            else:
+                values = a @ weights.reshape(cout, -1).T
+            y[:, g*cout:(g+1)*cout] = values.reshape(n, oh, ow, cout).transpose(0, 3, 1, 2)
+        if bias is not None and self.accumulation == "fp32":
             y += bias[None, :, None, None]
         return (y.astype(np.float16),)
 
@@ -179,7 +242,9 @@ class MixedGraph:
     explicitly instead of accepting an accidental precision-policy change.
     """
 
-    def __init__(self, path: Path, require_policy=True):
+    def __init__(self, path: Path, require_policy=True, accumulation="fp32"):
+        if accumulation not in ACCUMULATIONS:
+            raise ValueError(f"Unknown NN accumulation: {accumulation}")
         self.path = Path(path)
         self.model = onnx.load(str(self.path), load_external_data=False)
         props = {p.key: p.value for p in self.model.metadata_props}
@@ -198,6 +263,9 @@ class MixedGraph:
             raise NotImplementedError(f"Unsupported reference node: {node.domain}::{node.op_type}")
         self.evaluator = ReferenceEvaluator(
             self.model, new_ops=[Conv, MatMul, Gemm, GatherElements, scatter_sum, scatter_max], optimized=False)
+        for node in self.evaluator.rt_nodes_:
+            if isinstance(node, (Conv, MatMul, Gemm)):
+                node.accumulation = accumulation
 
     @staticmethod
     def _check_tensor(info, value, symbols):
@@ -254,10 +322,11 @@ class MixedGraph:
 
 
 class MixedReference:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, accumulation="fp32"):
         root = Path(model_dir)
-        self.feature_graph = MixedGraph(root / "feature_extractor_opset11.onnx")
-        self.update_graph = MixedGraph(root / "update_block_opset11.onnx")
+        self.accumulation = accumulation
+        self.feature_graph = MixedGraph(root / "feature_extractor_opset11.onnx", accumulation=accumulation)
+        self.update_graph = MixedGraph(root / "update_block_opset11.onnx", accumulation=accumulation)
 
     def feature(self, images):
         out = self.feature_graph.run({"images": np.asarray(images, dtype=np.float32)})
@@ -275,74 +344,8 @@ class MixedReference:
         import os
         import platform
         return {"backend": "onnx_reference_numpy", "policy": POLICY,
-                "nn_source": "onnx_initializers_not_checkpoint", "accumulation": "float32_reference_not_gemmini_pe",
+                "nn_source": "onnx_initializers_not_checkpoint", "accumulation": ACCUMULATIONS[self.accumulation],
                 "golden_float_storage": "float32", "numpy": np.__version__, "onnx": onnx.__version__,
                 "python": platform.python_version(), "platform": platform.platform(),
                 "thread_environment": {k: os.environ.get(k) for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")},
                 "feature": self.feature_graph.metadata(), "update": self.update_graph.metadata()}
-
-
-def main():
-    """Small real-network cases runnable without torch/CUDA or a checkpoint."""
-    import argparse
-    import json
-    parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("--onnx-model-dir", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
-    args = parser.parse_args()
-    from testdata_precision import prepare_reference
-    args.nn_precision = "fp16"
-    reference = prepare_reference(args)
-    # Exact dyadic input values; this is a synthetic NN case, not a trajectory.
-    image = ((np.arange(3*32*32) % 17 - 8) / 16).astype(np.float32).reshape(1, 1, 3, 32, 32)
-    fmap, imap = reference.feature(image)
-    def save(name, tensors):
-        root = args.output_root / name
-        root.mkdir(parents=True, exist_ok=True)
-        lines = ["# dpvo_runner_parity_case_v1"]
-        for key, value in tensors.items():
-            value = np.asarray(value)
-            # Existing parity readers expect float32 files. Widening half is exact.
-            if np.issubdtype(value.dtype, np.floating):
-                value = value.astype(np.float32)
-            if not np.all(np.isfinite(value)):
-                raise ValueError(f"{key}: nonfinite golden")
-            value = value.astype(value.dtype.newbyteorder("<"), copy=False)
-            np.ascontiguousarray(value).tofile(root / f"{key}.bin")
-            lines.append(f"{key} {value.dtype.name} " + " ".join(map(str, value.shape)))
-        (root / "manifest.txt").write_text("\n".join(lines) + "\n")
-    # Integer centers make the patch extraction oracle a direct array slice.
-    centers = np.array([[2, 2], [5, 5]], dtype=np.float32)
-    scaled_fmap = (fmap.astype(np.float32) * np.float32(.25)).astype(np.float16).astype(np.float32)
-    scaled_imap = (imap.astype(np.float32) * np.float32(.25)).astype(np.float16).astype(np.float32)
-    patches = np.empty((2, 3, 3, 3), np.float32)
-    colors = []
-    for i, (cx, cy) in enumerate(centers.astype(int)):
-        yy, xx = np.meshgrid(np.arange(cy-1, cy+2), np.arange(cx-1, cx+2), indexing="ij")
-        patches[i] = np.stack([xx, yy, np.ones_like(xx)])
-        colors.append(image[0, 0, :, 4*cy+2, 4*cx+2])
-    save("patchify_small", {
-        "image": image, "centers": centers, "golden_fmap": scaled_fmap,
-        "golden_imap": np.stack([scaled_imap[0, 0, :, y:y+1, x:x+1] for x, y in centers.astype(int)]),
-        "golden_gmap": np.stack([scaled_fmap[0, 0, :, y-1:y+2, x-1:x+2] for x, y in centers.astype(int)]),
-        "golden_patches": patches, "golden_colors": np.stack(colors)})
-    edges = 4
-    net = np.zeros((1, edges, 384), np.float16)
-    ctx = scaled_imap[0, 0, :, 2:4, 2:4].reshape(384, edges).T[None].astype(np.float16)
-    corr = ((np.arange(edges*882) % 13 - 6) / 32).astype(np.float16).reshape(1, edges, 882)
-    ii = np.array([0, 0, 0, 1], np.int64)
-    jj = np.array([1, 2, 3, 2], np.int64)
-    kk = np.array([0, 0, 0, 1], np.int64)
-    ix, jx = np.array([-1, 0, 1, -1], np.int64), np.array([1, 2, -1, -1], np.int64)
-    net_out, delta, weight = reference.update(net, ctx, corr, ii, jj, kk, ix, jx)
-    save("update_small", dict(net=net, ctx=ctx, corr=corr, ii=ii, jj=jj, kk=kk,
-                              golden_net=net_out, golden_delta=delta, golden_weight=weight))
-    (args.output_root / "metadata.json").write_text(json.dumps({
-        "format": "dpvo_mixed_nn_smoke_v1", "nn_reference": reference.metadata(),
-        "input": "deterministic synthetic 32x32 image and 4 update edges",
-        "scope": "patchify and update only; no correlation or BA golden"}, indent=2) + "\n")
-    print(f"Wrote graph-reference NN cases to {args.output_root}")
-
-
-if __name__ == "__main__":
-    main()

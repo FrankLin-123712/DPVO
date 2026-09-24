@@ -52,6 +52,15 @@ class Patchifier:
 
 
 class CaptureTests(unittest.TestCase):
+    def test_weight_fp16_yaml_still_builds_fp32_tracker(self):
+        from generate_dpvo_python_testdata import build_tracker_config
+        config = Path(__file__).resolve().parents[2] / "config/fast_p16_weight_fp16.yaml"
+        args = parse_args(["--config-yaml", str(config)])
+        cfg = build_tracker_config(args)
+        self.assertFalse(cfg.MIXED_PRECISION)
+        self.assertFalse(cfg.NN_FP16_WEIGHTS)
+        self.assertEqual(cfg.PATCHES_PER_FRAME, 16)
+
     def test_actual_call_is_observed_once_and_snapshots_are_owned(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

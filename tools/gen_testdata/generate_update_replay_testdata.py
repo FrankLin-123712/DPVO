@@ -34,7 +34,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weights", type=Path, default=REPO_ROOT / "dpvo.pth")
     parser.add_argument("--images", type=Path, default=REPO_ROOT / "datasets/EUROC/MH_01_easy/mav0/cam0/data")
     parser.add_argument("--calib", type=Path, default=REPO_ROOT / "calib/euroc.txt")
-    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "testdata/update_replay_euroc_mh01_first16_p16")
+    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "testdata/fp32/update_replay_euroc_mh01_first16_p16")
     parser.add_argument("--config-yaml", type=Path, help="Tracker settings; FP32 is always enforced after loading YAML.")
     parser.add_argument("--frame-start", type=int, default=1, help="1-based source image index.")
     parser.add_argument("--frame-count", type=int, default=16, help="At least 8, as required by the shared sequence loader.")
@@ -63,10 +63,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-motion-probes", action="store_true", help="Also capture network-only motion_probe cases.")
     args = parser.parse_args(argv)
     args.mixed_precision = False
+    args.nn_fp16_weights = False
     apply_config_yaml(args)
     if args.mixed_precision:
         print("Overriding YAML MIXED_PRECISION=True: update replay captures use FP32.")
     args.mixed_precision = False
+    if args.nn_fp16_weights:
+        print("Overriding YAML NN_FP16_WEIGHTS=True: update replay captures use FP32 weights.")
+    args.nn_fp16_weights = False
     for name in ("frame_start", "frame_count", "frame_step", "patches_per_frame", "buffer_size",
                  "removal_window", "optimization_window", "patch_lifetime", "ba_iterations"):
         if getattr(args, name) <= 0:

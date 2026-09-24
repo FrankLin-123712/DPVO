@@ -13,7 +13,7 @@ import numpy as np
 import onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as T
 
-from fp16_onnx_reference import MixedGraph, MixedReference, POLICY, scatter_max, scatter_sum
+from fp16_onnx_reference import MixedGraph, MixedReference, POLICY, _dim32_matmul, scatter_max, scatter_sum
 from testdata_precision import prepare_reference
 
 
@@ -25,14 +25,79 @@ class ReferenceTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def graph(self, nodes, inputs, outputs, initializers=(), policy=True):
+    def graph(self, nodes, inputs, outputs, initializers=(), policy=True, accumulation="fp32"):
         model = h.make_model(h.make_graph(nodes, "test", inputs, outputs, list(initializers)),
                              opset_imports=[h.make_opsetid("", 11), h.make_opsetid("dpvo", 1)], ir_version=7)
         if policy:
             h.set_model_props(model, {"dpvo_precision_policy": POLICY})
         path = self.root / "test.onnx"
         onnx.save(model, path)
-        return MixedGraph(path)
+        return MixedGraph(path, accumulation=accumulation)
+
+    def test_dim32_fused_rounding_blocks_and_fp32_bias(self):
+        # A rounded half product would lose this residual before adding -1.
+        a = np.array([[-1, 1 + 2**-10]], np.float16)
+        b = np.array([[1], [1 - 2**-11]], np.float16)
+        self.assertEqual(_dim32_matmul(a, b).item(), 2**-11 - 2**-21)
+        # A float32 intermediate would round this half-way case to -55552.
+        a = np.array([[-0.0009284019470214844, -151]], np.float16)
+        b = np.array([[1], [368]], np.float16)
+        self.assertEqual(_dim32_matmul(a, b).item(), -55584)
+        # Reset the half sum at K=32 and K=64; keep the inter-block 1 in FP32.
+        a = np.zeros((1, 65), np.float16)
+        a[0, [0, 32, 64]] = [2048, 1, -2048]
+        self.assertEqual(_dim32_matmul(a, np.ones((65, 1), np.float16)).item(), 1)
+        # Conv bias is present before the blocks, so this small bias is lost.
+        a[0, [0, 32, 64]] = [32768, -32768, 0]
+        self.assertEqual(_dim32_matmul(a, np.ones((65, 1), np.float16), 2**-12).item(), 0)
+
+    def test_dim32_matmul_vectors_broadcast_and_empty_k(self):
+        a = np.array([2048, 1, -2048], np.float16)
+        b = np.ones((2, 3, 4), np.float16)
+        np.testing.assert_array_equal(_dim32_matmul(a, b), np.zeros((2, 4)))
+        np.testing.assert_array_equal(_dim32_matmul(b.transpose(0, 2, 1), a), np.zeros((2, 4)))
+        self.assertEqual(_dim32_matmul(a, np.ones(3, np.float16)).shape, ())
+        np.testing.assert_array_equal(_dim32_matmul(np.empty((2, 0)), np.empty((0, 3))), np.zeros((2, 3)))
+
+    def test_dim32_graph_mode_does_not_leak_to_fp32_reference(self):
+        nodes = [h.make_node("MatMul", ["A", "B"], ["Y"])]
+        inputs = [h.make_tensor_value_info("A", T.FLOAT16, [1, 3]),
+                  h.make_tensor_value_info("B", T.FLOAT16, [3, 1])]
+        outputs = [h.make_tensor_value_info("Y", T.FLOAT16, [1, 1])]
+        pe = self.graph(nodes, inputs, outputs, accumulation="gemmini-dim32")
+        fp32 = self.graph(nodes, inputs, outputs)
+        feeds = {"A": np.array([[2048, 1, -2048]], np.float16), "B": np.ones((3, 1), np.float16)}
+        self.assertEqual(pe.run(feeds)["Y"].item(), 0)
+        self.assertEqual(fp32.run(feeds)["Y"].item(), 1)
+
+    def test_dim32_conv_kernel_channel_order_with_groups(self):
+        graph = self.graph([h.make_node("Conv", ["X", "W", "B"], ["Y"], group=2)],
+            [h.make_tensor_value_info("X", T.FLOAT16, [1, 4, 1, 2])],
+            [h.make_tensor_value_info("Y", T.FLOAT16, [1, 2, 1, 1])],
+            [nh.from_array(np.ones((2, 2, 1, 2), np.float16), "W"),
+             nh.from_array(np.array([.25, .5], np.float16), "B")], accumulation="gemmini-dim32")
+        # NHWC reduction: 2048, 1, -2048, 0. Channel-first reduction gives 1.
+        x = np.array([[[[2048, -2048]], [[1, 0]]] * 2], np.float16)
+        np.testing.assert_array_equal(graph.run({"X": x})["Y"].ravel(), [.25, .5])
+
+    def test_dim32_gemm_transpose_scaling_and_bias(self):
+        graph = self.graph([h.make_node("Gemm", ["A", "B", "C"], ["Y"],
+                                       transA=1, transB=1, alpha=2., beta=.5)],
+            [h.make_tensor_value_info("A", T.FLOAT16, [3, 1]),
+             h.make_tensor_value_info("B", T.FLOAT16, [1, 3])],
+            [h.make_tensor_value_info("Y", T.FLOAT16, [1, 1])],
+            [nh.from_array(np.array([3], np.float16), "C")], accumulation="gemmini-dim32")
+        result = graph.run({"A": np.array([[2048], [1], [-2048]], np.float16),
+                            "B": np.ones((1, 3), np.float16)})["Y"]
+        self.assertEqual(result.item(), 1.5)
+
+    def test_output_accumulation_collision(self):
+        (self.root / "metadata.json").write_text(json.dumps({"nn_reference": {
+            "accumulation": "float32_reference_not_gemmini_pe"}}))
+        args = argparse.Namespace(nn_precision="fp16", nn_accumulation="gemmini-dim32",
+                                  onnx_model_dir=self.root, output_root=self.root)
+        with self.assertRaisesRegex(ValueError, "different NN accumulation"):
+            prepare_reference(args)
 
     def test_half_rounding_happens_before_fp32_add(self):
         # 2048 + .75 -> 2048 in half. A following FP32 + .25 must survive.
@@ -161,28 +226,52 @@ class ReferenceTests(unittest.TestCase):
                 args = module.parse_args()
                 self.assertEqual(args.nn_precision, "fp32")
                 self.assertFalse(str(args.output_root).endswith("_fp16"))
+                self.assertEqual(args.output_root.parent.name, "fp32")
             with patch.object(sys, "argv", ["generator", "--nn-precision=fp16", "--onnx-model-dir", str(self.root)]):
                 args = module.parse_args()
                 self.assertTrue(str(args.output_root).endswith("_fp16"))
+                self.assertEqual(args.output_root.parent.name, "fp16")
                 if module is tracker:
                     config = tracker.build_tracker_config(args)
                     self.assertTrue(config.MIXED_PRECISION)
                     self.assertFalse(config.NN_FP16_WEIGHTS)
+            with patch.object(sys, "argv", ["generator", "--nn-precision=fp16", "--onnx-model-dir",
+                                           str(self.root), "--nn-accumulation=gemmini-dim32"]):
+                args = module.parse_args()
+                self.assertTrue(str(args.output_root).endswith("_fp16_dim32"))
 
     def test_shell_forwards_precision_without_overwriting_fp32_path(self):
         log = self.root / "calls"
         fake = self.root / "python"
         fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$CALL_LOG"\n')
         fake.chmod(0o755)
-        env = dict(os.environ, PYTHON_BIN=str(fake), CALL_LOG=str(log),
-                   NN_PRECISION="fp16", ONNX_MODEL_DIR="/models with spaces", TESTDATA_ROOT=str(self.root))
         script = Path(__file__).with_name("gen_testdata.sh")
-        subprocess.run(["bash", str(script), "0"], env=env, check=True, capture_output=True)
-        calls = log.read_text()
-        self.assertEqual(calls.count("--nn-precision"), 2)
-        self.assertIn("/models with spaces", calls)
-        self.assertIn("dpvo_runner_parity_small_fp16", calls)
-        self.assertIn("dpvo_python_fast_p16_fp16", calls)
+        for precision, accumulation in (("fp32", "fp32"), ("fp16", "fp32"), ("fp16", "gemmini-dim32")):
+            with self.subTest(precision=precision, accumulation=accumulation):
+                log.write_text("")
+                env = dict(os.environ, PYTHON_BIN=str(fake), CALL_LOG=str(log),
+                           NN_PRECISION=precision, ONNX_MODEL_DIR="/models with spaces",
+                           NN_ACCUMULATION=accumulation,
+                           TESTDATA_ROOT=str(self.root / "output with spaces"))
+                result = subprocess.run(["bash", str(script), "0"], env=env,
+                                        check=True, capture_output=True, text=True)
+                calls = log.read_text().splitlines()
+                self.assertEqual(calls.count("--nn-precision"), 2 if precision == "fp16" else 0)
+                if precision == "fp16":
+                    self.assertIn("/models with spaces", calls)
+                suffix = "_fp16" if precision == "fp16" else ""
+                if accumulation == "gemmini-dim32":
+                    suffix += "_dim32"
+                    self.assertEqual(calls.count("--nn-accumulation"), 2)
+                    self.assertEqual(calls.count("gemmini-dim32"), 2)
+                expected = [str(Path(env["TESTDATA_ROOT"]) / precision / (name + suffix))
+                            for name in ("dpvo_runner_parity_small", "dpvo_python_fast_p16")]
+                outputs = [calls[i + 1] for i, arg in enumerate(calls) if arg == "--output-root"]
+                self.assertEqual(outputs, expected)
+                prefix = "[INFO] Generating "
+                logged = [line[len(prefix):] for line in result.stdout.splitlines()
+                          if line.startswith(prefix)]
+                self.assertEqual(logged, outputs)
 
 
 class DeployedGraphTests(unittest.TestCase):
@@ -195,7 +284,7 @@ class DeployedGraphTests(unittest.TestCase):
         cls.runner = Path(value)
 
     def test_four_exact_ort_fixtures(self):
-        root = self.runner / "testdata/fp16_kernels"
+        root = self.runner / "testdata/fp16/fp16_kernels"
         paths = list(root.glob("*.onnx"))
         self.assertEqual(len(paths), 4)
         for path in paths:

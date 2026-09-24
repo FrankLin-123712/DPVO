@@ -37,7 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weights", type=Path, default=REPO_ROOT / "dpvo.pth")
     parser.add_argument("--images", type=Path, default=REPO_ROOT / "datasets/EUROC/MH_01_easy/mav0/cam0/data")
     parser.add_argument("--calib", type=Path, default=REPO_ROOT / "calib/euroc.txt")
-    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "testdata/correlation_replay_euroc_mh01_first16_p16")
+    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "testdata/fp32/correlation_replay_euroc_mh01_first16_p16")
     parser.add_argument("--config-yaml", type=Path, help="Tracker settings; FP32 is always enforced after loading YAML.")
     parser.add_argument("--frame-start", type=int, default=1, help="1-based source image index.")
     parser.add_argument("--frame-count", type=int, default=16, help="At least 8, as required by the shared sequence loader.")

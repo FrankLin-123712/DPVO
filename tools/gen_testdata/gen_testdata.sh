@@ -25,6 +25,7 @@ CALIB=${CALIB:-"$REPO_ROOT/calib/iphone.txt"}
 TESTDATA_ROOT=${TESTDATA_ROOT:-"$REPO_ROOT/testdata"}
 MODE=${1:-0}
 NN_PRECISION=${NN_PRECISION:-fp32}
+NN_ACCUMULATION=${NN_ACCUMULATION:-fp32}
 PRECISION_ARGS=()
 SUFFIX=""
 case "$NN_PRECISION" in
@@ -36,23 +37,35 @@ case "$NN_PRECISION" in
     ;;
   *) echo "[ERROR] NN_PRECISION must be fp32 or fp16" >&2; exit 2 ;;
 esac
-
+case "$NN_ACCUMULATION" in
+  fp32) ;;
+  gemmini-dim32)
+    if [ "$NN_PRECISION" != fp16 ]; then
+      echo "[ERROR] NN_ACCUMULATION=gemmini-dim32 requires NN_PRECISION=fp16" >&2
+      exit 2
+    fi
+    PRECISION_ARGS+=(--nn-accumulation "$NN_ACCUMULATION")
+    SUFFIX+="_dim32"
+    ;;
+  *) echo "[ERROR] NN_ACCUMULATION must be fp32 or gemmini-dim32" >&2; exit 2 ;;
+esac
 
 usage() {
   echo "Usage: NN_PRECISION=fp32|fp16 [ONNX_MODEL_DIR=...] $0 [MODE]"
+  echo "  NN_ACCUMULATION=fp32|gemmini-dim32 (default: fp32; gemmini-dim32 requires fp16)"
   echo "  MODE=0  Generate all testdata"
   echo "  MODE=1  Generate dpvo_runner_parity_small"
   echo "  MODE=2  Generate dpvo_python_fast_p16"
 }
 
 gen_dpvo_runner_parity_small() {
-  echo "[INFO] Generating $TESTDATA_ROOT/dpvo_runner_parity_small${SUFFIX}"
+  echo "[INFO] Generating $TESTDATA_ROOT/$NN_PRECISION/dpvo_runner_parity_small${SUFFIX}"
   "$PYTHON_BIN" "$SCRIPT_DIR/generate_dpvo_runner_parity_testdata.py" \
     --weights "$WEIGHTS" \
     --images "$IMAGES" \
     --calib "$CALIB" \
     "${PRECISION_ARGS[@]}" \
-    --output-root "$TESTDATA_ROOT/dpvo_runner_parity_small${SUFFIX}" \
+    --output-root "$TESTDATA_ROOT/$NN_PRECISION/dpvo_runner_parity_small${SUFFIX}" \
     --width 256 \
     --height 144 \
     --frame-start 1 \
@@ -61,13 +74,13 @@ gen_dpvo_runner_parity_small() {
 }
 
 gen_dpvo_python_fast_p16() {
-  echo "[INFO] Generating $TESTDATA_ROOT/dpvo_python_fast_p16${SUFFIX}"
+  echo "[INFO] Generating $TESTDATA_ROOT/$NN_PRECISION/dpvo_python_fast_p16${SUFFIX}"
   "$PYTHON_BIN" "$SCRIPT_DIR/generate_dpvo_python_testdata.py" \
     --weights "$WEIGHTS" \
     --images "$IMAGES" \
     --calib "$CALIB" \
     "${PRECISION_ARGS[@]}" \
-    --output-root "$TESTDATA_ROOT/dpvo_python_fast_p16${SUFFIX}" \
+    --output-root "$TESTDATA_ROOT/$NN_PRECISION/dpvo_python_fast_p16${SUFFIX}" \
     --frame-count 32 \
     --max-long-edge 256 \
     --patches-per-frame 16 \
@@ -80,6 +93,7 @@ gen_dpvo_python_fast_p16() {
 }
 
 echo "[INFO] NN_PRECISION: $NN_PRECISION (fp16 uses ONNX weights; --weights is unused)"
+echo "[INFO] NN_ACCUMULATION: $NN_ACCUMULATION"
 echo "[INFO] MODE: $MODE"
 echo "[INFO] PYTHON_BIN: $PYTHON_BIN"
 

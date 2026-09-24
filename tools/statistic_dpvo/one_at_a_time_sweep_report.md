@@ -1,5 +1,7 @@
 # DPVO One-at-a-Time Algorithmic Parameter Sweep 報告
 
+> 這是先前執行留下的歷史報告，不是本次文件檢查重新產生的結果。本機未保留對應的 `sweep_summary.csv` 與完整 evaluator JSON，以下數值按原紀錄保留，無法重新核對。舊 report template 曾固定填入預設參數與「已完成」文字；新的產生器已改用實際設定、執行順序與完成數。再次執行 sweep 會覆寫本檔。
+
 ## 範圍
 
 這份報告由 `tools/statistic_dpvo/sweep_dpvo.py` 產生。Sweep 方式是從
@@ -13,17 +15,17 @@ EuRoC sequences 依照 DPVO 論文 Table 2，以及本 repository 的
 
 ## 重現方式
 
-先準備資料與 runtime 環境：
+以下命令從 DPVO repository 根目錄執行，示範 BA_ITERATIONS 子集合；原始 run 的其他選項未完整保存，不能視為精確重現命令。先準備資料與 runtime 環境：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/download_euroc.py
+python3 tools/statistic_dpvo/download_euroc.py
 conda activate dpvo
 ```
 
-執行完整 sweep：
+執行 BA_ITERATIONS sweep：
 
 ```bash
-python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py --run-eval --trials 3 --parameters BA_ITERATIONS
+python3 tools/statistic_dpvo/sweep_dpvo.py --run-eval --trials 3 --parameters BA_ITERATIONS
 ```
 
 產生的輸出：
@@ -36,7 +38,7 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py --run-eval --trials 3 --paramete
 - `statistic_result/sequence_errors.csv`
 - `statistic_result/sweep_plots/*_sweep.svg`
 
-## Sweep 離散點
+## 當時文件列出的預設 Sweep 離散點（結果表僅含 BA_ITERATIONS）
 
 - `PATCHES_PER_FRAME`: 96, 80, 64, 48, 32
 - `PATCH_LIFETIME`: 13, 11, 9, 7, 5
@@ -47,45 +49,21 @@ python3 DPVO/tools/statistic_dpvo/sweep_dpvo.py --run-eval --trials 3 --paramete
 
 ## 目前結果摘要
 
-| parameter | 最低 candidate | 相對 sweep 起點的 ops 降幅 | 相對 sweep 起點的 mem 降幅 | ATE 狀態 |
+| parameter | 最後 candidate（原紀錄） | 相對 sweep 起點的 ops 降幅 | 相對 sweep 起點的 mem 降幅 | ATE 狀態 |
 | --- | ---: | ---: | ---: | --- |
 | `BA_ITERATIONS` | `20` | -0.3% | -1.9% | 完成 |
 
-ATE 狀態：已完成
+原報告標記 ATE 已完成；目前沒有對應 artifacts 可確認各 candidate 的完成情況。表中負降幅代表 endpoint 比起點增加，不能解讀為 workload 降低。
 
 所有 sweep plots 針對同一個 metric 共用同一組 y-axis range：藍線的 total ops 軸
 在所有圖一致，橘色虛線的 total mem 軸在所有圖一致，ATE 軸也會在所有圖一致。若尚未
 執行 ATE evaluation，綠色虛線只代表 ATE pending；等 `--run-eval` 產生 `ate_m`
 後會改畫實際 ATE 曲線。
 
-## 分析
+## 解讀限制
 
-Static estimator 顯示，當各參數逐步下降時，logical workload 符合預期地下降。
-`PATCHES_PER_FRAME`、`PATCH_LIFETIME` 與 `REMOVAL_WINDOW` 會直接降低 active
-factor count，因此會同時影響 update、correlation 與 BA-heavy modules。
-`OPTIMIZATION_WINDOW` 主要縮小 BA 中 free pose 的維度，所以對 front-end
-neural-network workload 的影響較小，但仍可能影響 trajectory consistency。
-新的 `BA_ITERATIONS` sweep 從 `20` 下降到 `2`；這能量化 solver refinement 次數
-對 BA workload 的線性影響，也能在後續 ATE 補齊時判斷 iteration 是否有 accuracy
-收益。較小的 `{H,W}` 會降低 feature extraction 與
-correlation traffic，但也會改變輸入影像訊號，並可能和 patch selection 產生強交互作用。
+目前結果表僅含 BA_ITERATIONS，不能據此推論其他參數的結果。上方預設點順序為 20 到 2，但原表 endpoint 是 20，兩者不一致；保留原數值供追查，需以原 CSV 確認實際順序後才能計算正確降幅。
 
-## 候選 Algorithmic Parameter Sets P_a
+Ops／memory 是 estimator 的固定 layer-boundary accounting，不是硬體量測。Correlation accounting 尚未反映 runner 目前先算整數格點 dot、再插值 scalar correlation 的實作。參數組合後的 accuracy 需另跑 evaluator，不能由單參數 sweep 推定。
 
-ATE 補齊後，建議先驗證下列候選組合：
-
-- `P_a_default`: `PATCHES_PER_FRAME=96`, `PATCH_LIFETIME=13`,
-  `REMOVAL_WINDOW=22`, `OPTIMIZATION_WINDOW=10`, `BA_ITERATIONS=2`,
-  `H,W=480x640`.
-- `P_a_balanced`: `PATCHES_PER_FRAME=64`, `PATCH_LIFETIME=11`,
-  `REMOVAL_WINDOW=18`, `OPTIMIZATION_WINDOW=8`, `BA_ITERATIONS=2`,
-  `H,W=384x512`.
-- `P_a_aggressive`: `PATCHES_PER_FRAME=48`, `PATCH_LIFETIME=9`,
-  `REMOVAL_WINDOW=14`, `OPTIMIZATION_WINDOW=6`, `BA_ITERATIONS=2`,
-  `H,W=320x416`.
-
-最終選擇規則：保留 EuRoC average ATE 增幅仍在 project tolerance 內的 candidates，
-再從這些 survivors 中選擇 total ops / total memory 最低的點。在目前尚未補齊 ATE
-前，`P_a_balanced` 是較適合作為第一個 combined candidate 的保守選擇，因為它避開
-最容易影響 accuracy 的變更（過低 `BA_ITERATIONS` 與過低 image size），同時仍能降低
-factor-graph size。
+目前工具操作與結果欄位請見 [README](README.md)。
